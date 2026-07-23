@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2 # 최신 패치 버전 지정
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0 # 최신 패치 버전 지정
         with:
           python-version: '3.10'
 
