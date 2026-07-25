@@ -38,22 +38,25 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 검색 키워드 정제 함수
+# 3. 💡 [수정됨] 검색 키워드 정제 함수 (상호명 + 시/도 + 시/군/구)
 # ---------------------------------------------------------------------------
 def build_search_query(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|의료법인|재단법인|법인', '', name).strip()
     addr_parts = address.split() if address else []
-    short_addr = ""
     
-    if len(addr_parts) >= 3:
-        short_addr = f"{addr_parts[1]} {addr_parts[2]}"
-    elif len(addr_parts) >= 2:
-        short_addr = addr_parts[1]
+    region_str = ""
+    if len(addr_parts) >= 2:
+        # 예: addr_parts[0] = "경기도", addr_parts[1] = "화성시"
+        region_str = f"{addr_parts[0]} {addr_parts[1]}"
+    elif len(addr_parts) == 1:
+        region_str = addr_parts[0]
         
-    return f"{short_addr} {clean_name}".strip()
+    # 원장님 의견 반영: 상호명을 먼저 띄우고 뒤에 지역명을 붙임
+    # 예: "내일한방병원 서울특별시 은평구"
+    return f"{clean_name} {region_str}".strip()
 
 # ---------------------------------------------------------------------------
-# 4. 💡 네이버 플레이스 정밀 크롤링 (광고 회피 및 한글 인코딩 완벽 적용)
+# 4. 네이버 플레이스 정밀 크롤링 (광고 회피 및 한글 인코딩)
 # ---------------------------------------------------------------------------
 def crawl_naver_place(query):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -72,13 +75,11 @@ def crawl_naver_place(query):
             print(f"    ⚠️ 네이버 검색 응답 실패 (Status: {res.status_code})")
             return None, None
             
-        # 검색 결과 전체가 아니라, '플레이스(병원)' 섹션만 추출하여 식당 등 광고 배제
         soup_search = BeautifulSoup(res.text, "html.parser")
         place_section = soup_search.select_one(".place_section, .sc_new.cs_place, .api_subject_bx")
         
         place_id = None
         if place_section:
-            # 병원 정보 고유 ID 타겟팅
             place_id_match = re.search(r'(?:hospital/|place/|data-id=")(\d{7,11})', str(place_section))
             if place_id_match:
                 place_id = place_id_match.group(1)
@@ -88,13 +89,11 @@ def crawl_naver_place(query):
             print(f"    🎯 [ID 확보] 실제 병원 고유번호 추출 성공: {place_id}")
             print(f"    🌐 [URL 확보] 다이렉트 링크: {navermap_url}")
             
-            # [홈 탭] 한글 깨짐 방지를 위한 UTF-8 강제 인코딩 적용
             res_home = requests.get(navermap_url, headers=headers, timeout=10)
             res_home.encoding = 'utf-8'  
             soup_home = BeautifulSoup(res_home.text, "html.parser")
             home_text = soup_home.get_text(separator=" ", strip=True)
             
-            # [정보 탭] 한글 깨짐 방지를 위한 UTF-8 강제 인코딩 적용
             res_info = requests.get(f"https://m.place.naver.com/hospital/{place_id}/information", headers=headers, timeout=10)
             res_info.encoding = 'utf-8'  
             soup_info = BeautifulSoup(res_info.text, "html.parser")
@@ -113,7 +112,7 @@ def crawl_naver_place(query):
         return None, None
 
 # ---------------------------------------------------------------------------
-# 5. 텍스트 분석 및 플래그 매핑 (원장님 맞춤형 추출 로직)
+# 5. 텍스트 분석 및 플래그 매핑
 # ---------------------------------------------------------------------------
 def parse_flags(text, name=""):
     flags = {
@@ -202,7 +201,6 @@ def main():
             flags = parse_flags(crawled_text, h_name)
             summary_text = crawled_text[:500] 
             
-            # DB 업데이트 (navermap_url 포함)
             sql_update = """
                 UPDATE hospitals 
                 SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
@@ -231,7 +229,6 @@ def main():
             print(f"    ⚠️ [수집 실패] 검색 결과를 찾지 못해 'N/A'로 처리했습니다.")
             print("-" * 70)
 
-        # 봇 차단 방지 딜레이
         time.sleep(random.uniform(2.5, 4.0))
 
     print("\n✨ 수고하셨습니다! 오늘의 네이버 플레이스 크롤링 및 DB 동기화가 무사히 끝났습니다.")
