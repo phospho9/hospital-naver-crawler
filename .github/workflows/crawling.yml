@@ -2,7 +2,7 @@ name: Daily Naver Place Crawler
 
 on:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 0,4,8,12,16,20 * * *'
   workflow_dispatch:
 
 jobs:
