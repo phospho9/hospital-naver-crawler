@@ -159,9 +159,9 @@ def main():
     sql_select = f"""
         SELECT id, name, address 
         FROM hospitals 
-        WHERE description IS NULL 
-        AND (name LIKE '%한의원%' OR name LIKE '%한방병원%' OR name LIKE '%생명마루%')
-        ORDER BY id ASC LIMIT {LIMIT}
+        WHERE (description IS NULL OR updated_at < datetime('now', '-90 days')) 
+        AND (name LIKE '%한의원%' OR name LIKE '%한방병원%')
+        ORDER BY updated_at ASC LIMIT {LIMIT}
     """
     hospitals = execute_d1_query(sql_select)
     
