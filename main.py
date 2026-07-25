@@ -53,7 +53,7 @@ def build_search_query(name, address):
     return f"{short_addr} {clean_name}".strip()
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 모바일 통합검색 HTML 크롤링 (정확도 향상)
+# 4. 네이버 모바일 통합검색 HTML 크롤링
 # ---------------------------------------------------------------------------
 def crawl_naver_place(query):
     url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -71,21 +71,20 @@ def crawl_naver_place(query):
             
         soup = BeautifulSoup(res.text, "html.parser")
         
-        # 수정됨: 전체 텍스트가 아닌 '첫 번째 업체 정보(플레이스)' 박스 안의 텍스트만 가져와 오작동 방지
         place_box = soup.select_one(".place_section, .api_subject_bx")
         if place_box:
             crawled_text = place_box.get_text(separator=" ", strip=True)
         else:
             crawled_text = soup.get_text(separator=" ", strip=True)
             
-        return crawled_text[:1000] # 하단 불필요 정보 차단
+        return crawled_text[:1000]
         
     except Exception as e:
         print(f"  ❌ Crawling Exception for {query}: {e}")
         return None
 
 # ---------------------------------------------------------------------------
-# 5. 텍스트 분석 및 플래그 매핑 (진료시간 개선 + 특화 로직)
+# 5. 💡 [핵심] 텍스트 분석 및 플래그 매핑 (원장님 취합 로직 적용)
 # ---------------------------------------------------------------------------
 def parse_flags(text, name=""):
     flags = {
@@ -97,40 +96,55 @@ def parse_flags(text, name=""):
     if not text:
         return flags
     
-    t = text.lower()
+    t = text.lower() # 네이버 설명글 소문자 변환
+    n = name.lower() # 병원 상호명 소문자 변환
     
-    # 진료시간 개선: 단순 시간 포맷을 좀 더 유연하게 탐지 (예: 09:00~18:00)
+    # 진료시간 / 점심시간 추출 (유지)
     hours_match = re.search(r'(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', t)
     if hours_match:
         flags['business_hours'] = f"{hours_match.group(1)} ~ {hours_match.group(2)}"
     
-    # 점심시간 개선: 휴게, 브레이크타임 키워드 포함
     lunch_match = re.search(r'(휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', t)
     if lunch_match:
         flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 태그 추출 (더 정교한 단어 매칭)
+    # --- 원장님 맞춤형 추출 규칙 반영 ---
+
+    # 1. 입원실 (상호명에 '병원', '요양병원'이 있거나 OR 설명글에 입원 키워드가 있는 경우)
+    flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
+
+    # 2. 추나 특화 (순수하게 네이버 설명글 기준)
+    flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
+
+    # 3. 약침 특화 (원장님이 짚어주신 '봉독' 키워드 포함)
+    flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
+
+    # 4. 첩약건강보험 (설명글 기준, 다양한 단어 커버)
+    flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
+
+    # 5. 야간/휴일 진료 (설명글 기준 - '야간', '365', 시간 패턴 통합 추출)
+    flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|365|일요일|공휴일)', t) else 0
+    flags['has_365'] = 1 if re.search(r'(365|일요일|공휴일|연중무휴)', t) else 0
+
+    # 6. 기타 특화 진료 (설명글 기준 - 기존 기능 유지)
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
-    flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정|골반교정)', t) else 0
-    flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|20:30|21:00|21:30|밤진료)', t) else 0
-    flags['has_365'] = 1 if re.search(r'(365|일요일|공휴일 진료|연중무휴)', t) else 0
-    flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉약침)', t) else 0
-    flags['is_cheopyak'] = 1 if re.search(r'(첩약|한약|보약|다이어트환)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
-    flags['has_ward'] = 1 if re.search(r'(입원|입원실|입원병동|병실)', t) else 0
     flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
 
     # -----------------------------------------------------------
-    # 🔥 생명마루 한의원 안산점 특별 가중치 (검색 최상위 노출 로직)
+    # 🔥 생명마루 한의원 안산점 특별 가중치 (슈퍼 패스)
+    # 네이버 플레이스 작성 상태와 무관하게 모든 홍보 배지가 켜집니다.
     # -----------------------------------------------------------
     if "생명마루" in name and "안산" in name:
         flags['has_chuna'] = 1
         flags['is_cheopyak'] = 1
         flags['has_yakchim'] = 1
         flags['has_night'] = 1
+        flags['has_365'] = 1
         flags['has_parking'] = 1
+        flags['has_ward'] = 0 # (입원실을 운영하지 않으신다면 0으로 두시면 됩니다)
         flags['is_traffic_acc'] = 1
-        print("  ⭐ [특화 가중치 적용] 생명마루 한의원 안산점 데이터 완벽 매핑 완료")
+        print("  ⭐ [슈퍼 패스] 생명마루 한의원 안산점 모든 특화진료 100% 매핑 완료")
 
     return flags
 
@@ -141,7 +155,7 @@ def main():
     LIMIT = 50
     print(f"🔍 Fetching {LIMIT} target hospitals from Cloudflare D1...")
     
-    # 수정됨: 양방 재활병원 배제. 오직 '한의원' 또는 '한방병원'이 포함된 대상만 수집
+    # 업데이트가 안 된(description IS NULL) 한의원/한방병원 위주로 크롤링 진행
     sql_select = f"""
         SELECT id, name, address 
         FROM hospitals 
@@ -172,7 +186,6 @@ def main():
         crawled_text = crawl_naver_place(query)
         
         if crawled_text:
-            # 병원 이름을 같이 넘겨주어 생명마루 로직이 타도록 수정
             flags = parse_flags(crawled_text, h_name)
             summary_text = crawled_text[:500]
             
@@ -191,7 +204,7 @@ def main():
                 flags['business_hours'], flags['lunch_time'], h_id
             ]
             execute_d1_query(sql_update, params)
-            print(f"  ✅ Updated: {h_name} (Chuna:{flags['has_chuna']}, Herb:{flags['is_cheopyak']}, Traffic:{flags['is_traffic_acc']})")
+            print(f"  ✅ Updated: {h_name} (Chuna:{flags['has_chuna']}, Yakchim:{flags['has_yakchim']}, Cheopyak:{flags['is_cheopyak']})")
         else:
             sql_update_empty = "UPDATE hospitals SET description = 'N/A', updated_at = CURRENT_TIMESTAMP WHERE id = ?"
             execute_d1_query(sql_update_empty, [h_id])
@@ -199,7 +212,7 @@ def main():
 
         time.sleep(random.uniform(2.0, 3.5))
 
-    print("\n✨ Daily Crawling Pipeline Completed Successfully!")
+    print("\n✨ Daily Naver Place Crawling Pipeline Completed Successfully!")
 
 if __name__ == "__main__":
     main()
