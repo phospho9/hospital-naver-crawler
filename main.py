@@ -152,7 +152,7 @@ def parse_flags(text, name=""):
 # 6. 메인 파이프라인 실행
 # ---------------------------------------------------------------------------
 def main():
-    LIMIT = 50
+    LIMIT = 80
     print(f"🔍 Fetching {LIMIT} target hospitals from Cloudflare D1...")
     
     # 업데이트가 안 된(description IS NULL) 한의원/한방병원 위주로 크롤링 진행
