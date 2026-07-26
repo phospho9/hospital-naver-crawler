@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4.2.2 # 최신 패치 버전 지정
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5.4.0 # 최신 패치 버전 지정
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
 
@@ -22,6 +22,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # 💡 [필수 추가] Playwright가 리눅스 환경(Ubuntu)에서 크롬을 띄우기 위해 필요한 브라우저 및 의존성 설치 단계
+      - name: Install Playwright Browsers
+        run: playwright install --with-deps chromium
 
       - name: Run Crawler
         env:
