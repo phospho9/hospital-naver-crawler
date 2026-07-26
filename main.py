@@ -4,6 +4,8 @@ import time
 import random
 import requests
 from bs4 import BeautifulSoup
+from collections import Counter
+from datetime import datetime, timezone, timedelta
 
 # ---------------------------------------------------------------------------
 # 1. 환경 변수 로드 (GitHub Secrets)
@@ -38,7 +40,7 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 💡 [수정됨] 검색 키워드 정제 함수 (상호명 + 시/도 + 시/군/구)
+# 3. 검색 키워드 정제 함수
 # ---------------------------------------------------------------------------
 def build_search_query(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|의료법인|재단법인|법인', '', name).strip()
@@ -46,17 +48,14 @@ def build_search_query(name, address):
     
     region_str = ""
     if len(addr_parts) >= 2:
-        # 예: addr_parts[0] = "경기도", addr_parts[1] = "화성시"
         region_str = f"{addr_parts[0]} {addr_parts[1]}"
     elif len(addr_parts) == 1:
         region_str = addr_parts[0]
         
-    # 원장님 의견 반영: 상호명을 먼저 띄우고 뒤에 지역명을 붙임
-    # 예: "내일한방병원 서울특별시 은평구"
     return f"{clean_name} {region_str}".strip()
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 플레이스 정밀 크롤링 (광고 회피 및 한글 인코딩)
+# 4. 네이버 플레이스 정밀 크롤링 (Raw HTML 포함 반환)
 # ---------------------------------------------------------------------------
 def crawl_naver_place(query):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -73,7 +72,7 @@ def crawl_naver_place(query):
         res = requests.get(search_url, headers=headers, timeout=10)
         if res.status_code != 200:
             print(f"    ⚠️ 네이버 검색 응답 실패 (Status: {res.status_code})")
-            return None, None
+            return None, None, None
             
         soup_search = BeautifulSoup(res.text, "html.parser")
         place_section = soup_search.select_one(".place_section, .sc_new.cs_place, .api_subject_bx")
@@ -86,12 +85,14 @@ def crawl_naver_place(query):
 
         if place_id:
             navermap_url = f"https://m.place.naver.com/hospital/{place_id}/home"
-            print(f"    🎯 [ID 확보] 실제 병원 고유번호 추출 성공: {place_id}")
+            print(f"    🎯 [ID 확보] 병원 고유번호 추출 성공: {place_id}")
             print(f"    🌐 [URL 확보] 다이렉트 링크: {navermap_url}")
             
             res_home = requests.get(navermap_url, headers=headers, timeout=10)
             res_home.encoding = 'utf-8'  
-            soup_home = BeautifulSoup(res_home.text, "html.parser")
+            raw_html = res_home.text
+            
+            soup_home = BeautifulSoup(raw_html, "html.parser")
             home_text = soup_home.get_text(separator=" ", strip=True)
             
             res_info = requests.get(f"https://m.place.naver.com/hospital/{place_id}/information", headers=headers, timeout=10)
@@ -100,41 +101,61 @@ def crawl_naver_place(query):
             info_text = soup_info.get_text(separator=" ", strip=True)
             
             combined_text = (home_text + " " + info_text)[:1500]
-            print(f"    📝 [텍스트 수집] 홈+정보 탭 파싱 완료 (총 {len(combined_text)}자)")
-            return combined_text, navermap_url
+            print(f"    📝 [텍스트 수집] 렌더링 텍스트 파싱 완료 (총 {len(combined_text)}자)")
+            
+            return combined_text, raw_html, navermap_url
             
         else:
-            print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다. 통합검색 기본 텍스트로 대체합니다.")
-            return soup_search.get_text(separator=" ", strip=True)[:1000], search_url
+            print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다. 통합검색 텍스트로 대체합니다.")
+            return soup_search.get_text(separator=" ", strip=True)[:1000], res.text, search_url
             
     except Exception as e:
         print(f"    ❌ 크롤링 중 예외 발생: {e}")
-        return None, None
+        return None, None, None
 
 # ---------------------------------------------------------------------------
-# 5. 텍스트 분석 및 플래그 매핑
+# 5. 💡 텍스트 분석 및 플래그 매핑 ("오늘" -> 실제 요일 변환 적용)
 # ---------------------------------------------------------------------------
-def parse_flags(text, name=""):
+def parse_flags(text, raw_html, name=""):
     flags = {
         'is_silbi': 0, 'has_chuna': 0, 'has_night': 0, 'has_365': 0, 
         'has_yakchim': 0, 'is_cheopyak': 0, 'has_parking': 0, 
         'has_ward': 0, 'is_traffic_acc': 0, 'business_hours': None, 'lunch_time': None
     }
     
-    if not text:
+    if not text or not raw_html:
         return flags
+        
+    # 💡 [핵심] KST 기준 오늘 요일 구하기
+    kst = timezone(timedelta(hours=9))
+    today_kst = datetime.now(kst)
+    weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
+    today_str = weekdays[today_kst.weekday()]
     
-    t = text.lower()
+    # "오늘"이라는 글자를 모두 실제 요일로 변환하여 데이터 일관성 확보
+    t = text.lower().replace("오늘", today_str)
+    raw_html = raw_html.replace("오늘", today_str)
     n = name.lower()
     
-    hours_match = re.search(r'(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', t)
-    if hours_match:
-        flags['business_hours'] = f"{hours_match.group(1)} ~ {hours_match.group(2)}"
+    # 1. 진료시간 (API 데이터 타겟팅)
+    starts = re.findall(r'"startTime"\s*:\s*"(\d{1,2}:\d{2})"', raw_html)
+    ends = re.findall(r'"endTime"\s*:\s*"(\d{1,2}:\d{2})"', raw_html)
     
-    lunch_match = re.search(r'(휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', t)
+    if starts and ends:
+        pairs = list(zip(starts, ends))
+        most_common_hours = Counter(pairs).most_common(1)[0][0]
+        flags['business_hours'] = f"{most_common_hours[0]} ~ {most_common_hours[1]}"
+    else:
+        hours_match = re.search(r'(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', raw_html)
+        if hours_match:
+            flags['business_hours'] = f"{hours_match.group(1)} ~ {hours_match.group(2)}"
+
+    # 2. 휴게/점심시간
+    lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', raw_html)
     if lunch_match:
         flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
+    # 특화 진료 추출 (변환된 텍스트 t 활용)
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
@@ -182,7 +203,7 @@ def main():
         print("🎉 모든 병원 정보가 최신 상태입니다. 크롤러를 종료합니다.")
         return
 
-    print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. 정밀 크롤링을 시작합니다!\n")
+    print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. API 타겟팅 정밀 크롤링을 시작합니다!\n")
     print("=" * 70)
 
     for idx, h in enumerate(hospitals, 1):
@@ -192,13 +213,12 @@ def main():
         
         query = build_search_query(h_name, h_addr)
         print(f"[{idx}/{len(hospitals)}] 🏥 병원명: {h_name} (ID: {h_id[:8]}...)")
-        print(f"    - 원본 주소: {h_addr}")
         print(f"    - 검색 키워드: {query}")
         
-        crawled_text, map_url = crawl_naver_place(query)
+        crawled_text, raw_html, map_url = crawl_naver_place(query)
         
-        if crawled_text:
-            flags = parse_flags(crawled_text, h_name)
+        if crawled_text and raw_html:
+            flags = parse_flags(crawled_text, raw_html, h_name)
             summary_text = crawled_text[:500] 
             
             sql_update = """
@@ -221,7 +241,6 @@ def main():
             print(f"       - 🕒 진료시간: {flags['business_hours']} / 점심: {flags['lunch_time']}")
             print(f"       - 💊 특화진료: 추나({flags['has_chuna']}) 약침({flags['has_yakchim']}) 첩약({flags['is_cheopyak']}) 입원({flags['has_ward']})")
             print(f"       - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
-            print(f"       - 📝 본문미리보기: {summary_text[:60].replace(chr(10), ' ')}...")
             print("-" * 70)
         else:
             sql_update_empty = "UPDATE hospitals SET description = 'N/A', updated_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -231,7 +250,7 @@ def main():
 
         time.sleep(random.uniform(2.5, 4.0))
 
-    print("\n✨ 수고하셨습니다! 오늘의 네이버 플레이스 크롤링 및 DB 동기화가 무사히 끝났습니다.")
+    print("\n✨ 수고하셨습니다! 오늘의 네이버 플레이스 정밀 크롤링이 무사히 끝났습니다.")
 
 if __name__ == "__main__":
     main()
