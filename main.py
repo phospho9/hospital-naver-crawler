@@ -39,36 +39,47 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 💡 다중 검색 키워드 생성 함수 (1, 2, 3단계 폴백 적용)
+# 3. 💡 원장님 제안 반영: 4단계 정교한 폴백 검색 키워드 생성 함수
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
+    # (주), 의료법인, 재단법인 등 심평원 DB 특유의 표기를 깔끔하게 제거
     clean_name = re.sub(r'\(주\)|\(유\)|의료법인|재단법인|법인', '', name).strip()
     addr_parts = address.split() if address else []
     
     queries = []
     
-    if len(addr_parts) >= 2:
-        # 1단계: 병원명 + 시/도 + 구/군 (예: 첨단유진한방병원 전남광주통합특별시 광산구)
-        queries.append(f"{clean_name} {addr_parts[0]} {addr_parts[1]}")
-        # 2단계: 병원명 + 시/도 (예: 첨단유진한방병원 전남광주통합특별시)
-        queries.append(f"{clean_name} {addr_parts[0]}")
-    elif len(addr_parts) == 1:
-        # 1단계: 병원명 + 시/도
-        queries.append(f"{clean_name} {addr_parts[0]}")
+    province = addr_parts[0] if len(addr_parts) > 0 else "" # 예: 충청남도
+    city_gun = addr_parts[1] if len(addr_parts) > 1 else "" # 예: 천안시
+    detail_addr = addr_parts[2] if len(addr_parts) > 2 else "" # 예: 중앙대로 (도로명 등)
+    
+    # 1단계: 병원명 + 시/도 + 구/군 (예: 삼거리한의원 충청남도 천안시)
+    if province and city_gun:
+        queries.append(f"{clean_name} {province} {city_gun}")
         
-    # 3단계: 최후의 보루, 병원명 단독 검색 (예: 첨단유진한방병원)
+    # 2단계: 병원명 + 구/군만 (예: 삼거리한의원 천안시)
+    if city_gun:
+        queries.append(f"{clean_name} {city_gun}")
+    elif province:
+        queries.append(f"{clean_name} {province}")
+        
+    # 3단계: 병원명 + 상세 주소 키워드 (예: 삼거리한의원 중앙대로)
+    if detail_addr:
+        queries.append(f"{clean_name} {detail_addr}")
+        
+    # 4단계: 최후의 보루, 병원명 단독 검색 (예: 삼거리한의원)
     queries.append(clean_name)
     
-    # 중복 검색어 제거 (순서는 유지)
+    # 중복 제거 및 빈 문자열 제거
     unique_queries = []
     for q in queries:
-        if q not in unique_queries:
-            unique_queries.append(q)
+        q_cleaned = q.strip()
+        if q_cleaned and q_cleaned not in unique_queries:
+            unique_queries.append(q_cleaned)
             
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 플레이스 정밀 크롤링 (성공 여부 flag 추가 반환)
+# 4. 네이버 플레이스 정밀 크롤링
 # ---------------------------------------------------------------------------
 def crawl_naver_place(query):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -116,12 +127,10 @@ def crawl_naver_place(query):
             combined_text = (home_text + " " + info_text)[:1500]
             print(f"    📝 [텍스트 수집] 렌더링 텍스트 파싱 완료 (총 {len(combined_text)}자)")
             
-            # 성공 시 True 반환
             return combined_text, raw_html, navermap_url, True
             
         else:
             print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
-            # 실패 시 False 반환 (폴백 텍스트만 전달)
             return soup_search.get_text(separator=" ", strip=True)[:1000], res.text, search_url, False
             
     except Exception as e:
@@ -189,7 +198,8 @@ def parse_flags(text, raw_html, name=""):
     if schedule['공휴일']:
         formatted_hours.append(f"공휴일: {schedule['공휴일']}")
         
-    flags['business_hours'] = "\n".join(formatted_hours) if formatted_hours else None
+    # 데이터 신뢰성 확보: 월~일 스케줄이 전혀 파싱되지 않았다면 None 처리 (유령 데이터 방지)
+    flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
     if schedule['점심시간']:
         flags['lunch_time'] = schedule['점심시간']
@@ -245,7 +255,7 @@ def main():
         print("🎉 모든 병원 정보가 최신 상태입니다. 크롤러를 종료합니다.")
         return
 
-    print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. API 타겟팅 정밀 크롤링을 시작합니다!\n")
+    print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. 4단계 폴백 정밀 크롤링을 시작합니다!\n")
     print("=" * 70)
 
     for idx, h in enumerate(hospitals, 1):
@@ -255,31 +265,28 @@ def main():
         
         print(f"[{idx}/{len(hospitals)}] 🏥 병원명: {h_name} (ID: {h_id[:8]}...)")
         
-        # 💡 [핵심] 여러 개의 완화된 검색어 리스트 생성
+        # 💡 4단계 폴백 검색어 리스트 생성
         query_list = build_search_queries(h_name, h_addr)
         
         crawled_text, raw_html, map_url = None, None, None
+        search_success = False
         
-        # 💡 [핵심] 성공할 때까지 순차적으로 1, 2, 3단계 검색 시도
-        for step, query in enumerate(query_list):
-            if step > 0:
-                print(f"    🔄 [검색어 완화 재시도 {step}] 키워드: {query}")
-            else:
-                print(f"    - 1차 검색 키워드: {query}")
-                
+        # 💡 1단계부터 4단계까지 순차적 탐색
+        for step, query in enumerate(query_list, 1):
+            print(f"    - {step}차 검색 키워드: {query}")
             text, html, url, is_success = crawl_naver_place(query)
             
-            # 루프를 돌며 가장 마지막 결과를 임시 저장
-            crawled_text, raw_html, map_url = text, html, url
-            
             if is_success:
-                break # ID 추출 성공 시 더 이상 하위 검색어로 재시도하지 않음
+                crawled_text, raw_html, map_url = text, html, url
+                search_success = True
+                break # 성공 시 즉시 탈출
             else:
-                # 실패 시 네이버 봇 차단을 막기 위해 잠시 대기 후 다음 단계 검색어로 이동
-                if step < len(query_list) - 1:
-                    time.sleep(1.5)
+                if step < len(query_list):
+                    print(f"    🔄 [검색 실패] 다음 단계 검색어로 재시도합니다.")
+                    time.sleep(1.0)
         
-        if crawled_text and raw_html and map_url:
+        # 💡 실제로 네이버 플레이스 ID 및 데이터를 정확히 건졌을 때만 정상 UPDATE 실행
+        if search_success and crawled_text and raw_html and map_url:
             flags = parse_flags(crawled_text, raw_html, h_name)
             summary_text = crawled_text[:500] 
             
@@ -309,7 +316,7 @@ def main():
             print(f"       - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
             print("-" * 70)
         else:
-            # 3단계까지 전부 실패한 경우 (또는 완전한 N/A 처리 시)
+            # 4단계까지 모두 실패한 경우 엉뚱한 값으로 덮어쓰지 않고 안전하게 N/A 처리
             sql_update_empty = "UPDATE hospitals SET description = 'N/A', updated_at = CURRENT_TIMESTAMP WHERE id = ?"
             execute_d1_query(sql_update_empty, [h_id])
             print(f"    ⚠️ [최종 수집 실패] 모든 검색 단계를 거쳤으나 찾지 못해 'N/A'로 처리했습니다.")
