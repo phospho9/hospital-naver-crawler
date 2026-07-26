@@ -39,22 +39,36 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 검색 키워드 정제 함수
+# 3. 💡 다중 검색 키워드 생성 함수 (1, 2, 3단계 폴백 적용)
 # ---------------------------------------------------------------------------
-def build_search_query(name, address):
+def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|의료법인|재단법인|법인', '', name).strip()
     addr_parts = address.split() if address else []
     
-    region_str = ""
+    queries = []
+    
     if len(addr_parts) >= 2:
-        region_str = f"{addr_parts[0]} {addr_parts[1]}"
+        # 1단계: 병원명 + 시/도 + 구/군 (예: 첨단유진한방병원 전남광주통합특별시 광산구)
+        queries.append(f"{clean_name} {addr_parts[0]} {addr_parts[1]}")
+        # 2단계: 병원명 + 시/도 (예: 첨단유진한방병원 전남광주통합특별시)
+        queries.append(f"{clean_name} {addr_parts[0]}")
     elif len(addr_parts) == 1:
-        region_str = addr_parts[0]
+        # 1단계: 병원명 + 시/도
+        queries.append(f"{clean_name} {addr_parts[0]}")
         
-    return f"{clean_name} {region_str}".strip()
+    # 3단계: 최후의 보루, 병원명 단독 검색 (예: 첨단유진한방병원)
+    queries.append(clean_name)
+    
+    # 중복 검색어 제거 (순서는 유지)
+    unique_queries = []
+    for q in queries:
+        if q not in unique_queries:
+            unique_queries.append(q)
+            
+    return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 플레이스 정밀 크롤링 (Raw HTML 포함 반환)
+# 4. 네이버 플레이스 정밀 크롤링 (성공 여부 flag 추가 반환)
 # ---------------------------------------------------------------------------
 def crawl_naver_place(query):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -71,7 +85,7 @@ def crawl_naver_place(query):
         res = requests.get(search_url, headers=headers, timeout=10)
         if res.status_code != 200:
             print(f"    ⚠️ 네이버 검색 응답 실패 (Status: {res.status_code})")
-            return None, None, None
+            return None, None, None, False
             
         soup_search = BeautifulSoup(res.text, "html.parser")
         place_section = soup_search.select_one(".place_section, .sc_new.cs_place, .api_subject_bx")
@@ -102,18 +116,20 @@ def crawl_naver_place(query):
             combined_text = (home_text + " " + info_text)[:1500]
             print(f"    📝 [텍스트 수집] 렌더링 텍스트 파싱 완료 (총 {len(combined_text)}자)")
             
-            return combined_text, raw_html, navermap_url
+            # 성공 시 True 반환
+            return combined_text, raw_html, navermap_url, True
             
         else:
-            print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다. 통합검색 텍스트로 대체합니다.")
-            return soup_search.get_text(separator=" ", strip=True)[:1000], res.text, search_url
+            print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
+            # 실패 시 False 반환 (폴백 텍스트만 전달)
+            return soup_search.get_text(separator=" ", strip=True)[:1000], res.text, search_url, False
             
     except Exception as e:
         print(f"    ❌ 크롤링 중 예외 발생: {e}")
-        return None, None, None
+        return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 5. 💡 텍스트 분석 및 플래그 매핑 ("오늘" -> 실제 요일 변환 적용)
+# 5. 텍스트 분석 및 플래그 매핑 (요일 구조화 적용)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -125,25 +141,21 @@ def parse_flags(text, raw_html, name=""):
     if not text or not raw_html:
         return flags
         
-    # 💡 [핵심] KST 기준 오늘 요일 구하기
     kst = timezone(timedelta(hours=9))
     today_kst = datetime.now(kst)
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     today_str = weekdays[today_kst.weekday()]
     
-    # "오늘"이라는 글자를 모두 실제 요일로 변환하여 데이터 일관성 확보
     t = text.lower().replace("오늘", today_str)
     raw_html_lower = raw_html.lower().replace("오늘", today_str)
     n = name.lower()
     
-    # 1. 진료시간 (월~일 주간 스케줄 전체 파싱)
     schedule = {
         '월요일': '정보 없음', '화요일': '정보 없음', '수요일': '정보 없음',
         '목요일': '정보 없음', '금요일': '정보 없음', '토요일': '정보 없음',
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 정규식: 평일, 요일, 공휴일, 점심 시간대 추출
     time_pattern = re.compile(r'(평일|토요일|일요일|매주\s*일요일|공휴일|점심|월요일|화요일|수요일|목요일|금요일)\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진)')
     matches = time_pattern.findall(t + " " + raw_html_lower)
     
@@ -165,12 +177,10 @@ def parse_flags(text, raw_html, name=""):
         elif key in weekdays:
             schedule[key] = val
 
-    # 단독 '휴무/휴진' 텍스트 처리
     for day in weekdays:
         if f"{day} 휴무" in t or f"{day} 휴진" in t:
             schedule[day] = '휴무'
 
-    # 결과 조합 (월~일 순서)
     formatted_hours = []
     for day in weekdays:
         if schedule[day] != '정보 없음':
@@ -181,7 +191,6 @@ def parse_flags(text, raw_html, name=""):
         
     flags['business_hours'] = "\n".join(formatted_hours) if formatted_hours else None
     
-    # 2. 휴게/점심시간 (위 정규식에서 잡지 못한 경우를 대비한 2차 탐색)
     if schedule['점심시간']:
         flags['lunch_time'] = schedule['점심시간']
     else:
@@ -189,7 +198,6 @@ def parse_flags(text, raw_html, name=""):
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 3. 특화 진료 추출
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
@@ -245,13 +253,33 @@ def main():
         h_name = h["name"]
         h_addr = h.get("address", "")
         
-        query = build_search_query(h_name, h_addr)
         print(f"[{idx}/{len(hospitals)}] 🏥 병원명: {h_name} (ID: {h_id[:8]}...)")
-        print(f"    - 검색 키워드: {query}")
         
-        crawled_text, raw_html, map_url = crawl_naver_place(query)
+        # 💡 [핵심] 여러 개의 완화된 검색어 리스트 생성
+        query_list = build_search_queries(h_name, h_addr)
         
-        if crawled_text and raw_html:
+        crawled_text, raw_html, map_url = None, None, None
+        
+        # 💡 [핵심] 성공할 때까지 순차적으로 1, 2, 3단계 검색 시도
+        for step, query in enumerate(query_list):
+            if step > 0:
+                print(f"    🔄 [검색어 완화 재시도 {step}] 키워드: {query}")
+            else:
+                print(f"    - 1차 검색 키워드: {query}")
+                
+            text, html, url, is_success = crawl_naver_place(query)
+            
+            # 루프를 돌며 가장 마지막 결과를 임시 저장
+            crawled_text, raw_html, map_url = text, html, url
+            
+            if is_success:
+                break # ID 추출 성공 시 더 이상 하위 검색어로 재시도하지 않음
+            else:
+                # 실패 시 네이버 봇 차단을 막기 위해 잠시 대기 후 다음 단계 검색어로 이동
+                if step < len(query_list) - 1:
+                    time.sleep(1.5)
+        
+        if crawled_text and raw_html and map_url:
             flags = parse_flags(crawled_text, raw_html, h_name)
             summary_text = crawled_text[:500] 
             
@@ -281,9 +309,10 @@ def main():
             print(f"       - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
             print("-" * 70)
         else:
+            # 3단계까지 전부 실패한 경우 (또는 완전한 N/A 처리 시)
             sql_update_empty = "UPDATE hospitals SET description = 'N/A', updated_at = CURRENT_TIMESTAMP WHERE id = ?"
             execute_d1_query(sql_update_empty, [h_id])
-            print(f"    ⚠️ [수집 실패] 검색 결과를 찾지 못해 'N/A'로 처리했습니다.")
+            print(f"    ⚠️ [최종 수집 실패] 모든 검색 단계를 거쳤으나 찾지 못해 'N/A'로 처리했습니다.")
             print("-" * 70)
 
         time.sleep(random.uniform(2.5, 4.0))
