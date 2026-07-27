@@ -178,11 +178,11 @@ def parse_flags(text, raw_html, name=""):
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
-    flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
+    flags['is_cheopyak'] = 1 if re.search(r'(첩약건강)', t) else 0
     flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
     # 💡 '365', '연중무휴', '매일진료/매일 진료' 키워드만 명확히 감지
     flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
-    flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
+    flags['is_silbi'] = 1 if re.search(r'(실비|실손|사보험|도수|충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
     flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
 
