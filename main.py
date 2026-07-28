@@ -170,10 +170,14 @@ def crawl_naver_place_with_playwright(query, page):
                 
             # 💡 [테스트용 수집 길이 확대: 6,000자]
             combined_text = cleaned_combined[:6000]
-            
-            preview_text = combined_text.replace('\n', ' ')[:300]
+
+            # 수정 전 (300자 절삭)
+            # preview_text = combined_text.replace('\n', ' ')[:300]
+
+            # 수정 후 (전체 출력)
+
             print(f"    📝 [텍스트 수집 성공 (노이즈 제거 후 총 {len(combined_text)}자)]")
-            print(f"       📄 정제된 미리보기: \"{preview_text}...\"")
+            print(f"       📄 전체 수집내용 보기: \"{combined_text}...\"")
             
             return combined_text, raw_html, navermap_url, True
         else:
