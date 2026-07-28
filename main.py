@@ -95,17 +95,16 @@ def determine_hanbang_type(name, raw_text):
     if "한양방" in n or "양한방" in n or "협진" in n:
         return "한양방"
     
-    # 3. 주변 탭 텍스트 오염 방지를 위해 본문에서는 완벽히 서술된 협진/한방진료 표현만 인정
-    # (단순 '한의사', '한방과' 키워드는 주변 한의원 노출 텍스트일 수 있어 제외)
-    strict_hanbang_keywords = r'(한양방\s*협진\s*병원|양한방\s*협진\s*병원|한양방\s*통합|본\s*병원은\s*한방|한방과\s*설치|한방진료실)'
+    # 3. 주변 탭 오염 방지: 병원이 '직접' 명시한 한방/협진 문구만 인정
+    strict_hanbang_keywords = r'(한양방\s*협진\s*병원|양한방\s*협진\s*병원|한양방\s*통합|본\s*병원은\s*한방|한방과\s*설치|한방진료실|한의사\s*상주)'
     if re.search(strict_hanbang_keywords, t):
         return "한양방"
     
-    # 4. 그 외 모든 일반 병원/의원/요양병원은 "양방"으로 안전하게 처리
+    # 4. 그 외 모든 일반 양방 병원/의원/산부인과/정형외과는 "양방"
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 5. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (아코디언 자동 펼침 포함)
+# 5. Playwright 정밀 크롤링 (앞쪽 UI 노이즈 절단 & 6000자 수집)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -130,6 +129,7 @@ def crawl_naver_place_with_playwright(query, page):
             page.goto(navermap_url, timeout=15000)
             page.wait_for_timeout(2000)
             
+            # 아코디언(펼쳐보기, 더보기 등) 클릭
             try:
                 expand_buttons = page.locator("text=펼쳐보기, text=더보기, text=영업시간 수정 제안하기, .group_fold")
                 for i in range(expand_buttons.count()):
@@ -151,11 +151,29 @@ def crawl_naver_place_with_playwright(query, page):
             except Exception:
                 info_text = ""
                 
-            combined_text = (home_text + " " + info_text)[:2000]
+            raw_combined = home_text + "\n" + info_text
+            
+            # 💡 [전반부 UI 쓰레기 텍스트 절단]
+            # "주소", "영업시간", "홈 리뷰 사진 지도", "전화번호" 키워드 시작점 이전 텍스트 절삭
+            cut_keywords = ["주소", "영업시간", "홈 리뷰 사진 지도", "전화번호"]
+            cut_index = -1
+            for kw in cut_keywords:
+                idx = raw_combined.find(kw)
+                if idx != -1:
+                    if cut_index == -1 or idx < cut_index:
+                        cut_index = idx
+            
+            if cut_index != -1 and cut_index > 50:
+                cleaned_combined = raw_combined[cut_index:]
+            else:
+                cleaned_combined = raw_combined
+                
+            # 💡 [테스트용 수집 길이 확대: 6,000자]
+            combined_text = cleaned_combined[:6000]
             
             preview_text = combined_text.replace('\n', ' ')[:300]
-            print(f"    📝 [텍스트 수집 성공 (총 {len(combined_text)}자)]")
-            print(f"       📄 미리보기: \"{preview_text}...\"")
+            print(f"    📝 [텍스트 수집 성공 (노이즈 제거 후 총 {len(combined_text)}자)]")
+            print(f"       📄 정제된 미리보기: \"{preview_text}...\"")
             
             return combined_text, raw_html, navermap_url, True
         else:
@@ -167,7 +185,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (휴무 오탐 방지 및 축약 요일 파싱)
+# 6. 텍스트 분석 및 플래그 매핑 (축약 요일 파싱 지원)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
