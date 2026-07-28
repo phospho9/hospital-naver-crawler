@@ -153,8 +153,7 @@ def crawl_naver_place_with_playwright(query, page):
                 
             raw_combined = home_text + "\n" + info_text
             
-            # 💡 [전반부 UI 쓰레기 텍스트 절단]
-            # "주소", "영업시간", "홈 리뷰 사진 지도", "전화번호" 키워드 시작점 이전 텍스트 절삭
+            # [전반부 UI 쓰레기 텍스트 절단]
             cut_keywords = ["주소", "영업시간", "홈 리뷰 사진 지도", "전화번호"]
             cut_index = -1
             for kw in cut_keywords:
@@ -168,16 +167,11 @@ def crawl_naver_place_with_playwright(query, page):
             else:
                 cleaned_combined = raw_combined
                 
-            # 💡 [테스트용 수집 길이 확대: 6,000자]
+            # 테스트 및 정밀 파싱용 6,000자 확보
             combined_text = cleaned_combined[:6000]
 
-            # 수정 전 (300자 절삭)
-            # preview_text = combined_text.replace('\n', ' ')[:300]
-
-            # 수정 후 (전체 출력)
-
             print(f"    📝 [텍스트 수집 성공 (노이즈 제거 후 총 {len(combined_text)}자)]")
-            print(f"       📄 전체 수집내용 보기: \"{combined_text}...\"")
+            print(f"       📄 전체 수집내용 보기:\n\"{combined_text}\"\n")
             
             return combined_text, raw_html, navermap_url, True
         else:
@@ -189,7 +183,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (축약 요일 파싱 지원)
+# 6. 텍스트 분석 및 플래그 매핑 (중복 매칭 및 점심시간 패턴 보완)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -223,17 +217,15 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 3. 요일(월/월요일 모두 대응) + 시간 패턴 파싱
-    time_range_pattern = re.compile(
-        r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|월|화|수|목|금|토|일|평일|공휴일)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2})'
+    # 3. 요일시간 정밀 매칭 (긴 요일명 우선 추출)
+    # 1차: '월요일'~'일요일' 3글자 전체 매칭
+    time_range_pattern_long = re.compile(
+        r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2})'
     )
-    time_matches = time_range_pattern.findall(cleaned_text)
+    long_matches = time_range_pattern_long.findall(cleaned_text)
     
-    day_map = {'월': '월요일', '화': '화요일', '수': '수요일', '목': '목요일', '금': '금요일', '토': '토요일', '일': '일요일'}
-    
-    for match in time_matches:
-        raw_key = match[0].strip()
-        key = day_map.get(raw_key, raw_key)
+    for match in long_matches:
+        key = match[0].strip()
         val = match[1].replace('–', '~').replace('-', '~').strip()
         
         if key == '평일':
@@ -244,6 +236,19 @@ def parse_flags(text, raw_html, name=""):
             schedule[key] = val
         elif '공휴일' in key:
             schedule['공휴일'] = val
+
+    # 2차: 1차에서 잡히지 않은 요일에 한해 단축 요일('월'~'일') 매칭
+    day_map = {'월': '월요일', '화': '화요일', '수': '수요일', '목': '목요일', '금': '금요일', '토': '토요일', '일': '일요일'}
+    time_range_pattern_short = re.compile(
+        r'(?:^|\s)(월|화|수|목|금|토|일)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2})'
+    )
+    short_matches = time_range_pattern_short.findall(cleaned_text)
+    for match in short_matches:
+        raw_key = match[0].strip()
+        key = day_map.get(raw_key)
+        val = match[1].replace('–', '~').replace('-', '~').strip()
+        if key and schedule[key] == '정보 없음':
+            schedule[key] = val
 
     # 4. 시간 미파싱 요일 정기휴무 검사
     for day in weekdays:
@@ -263,20 +268,24 @@ def parse_flags(text, raw_html, name=""):
         
     flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
-    # 6. 점심시간 파싱
+    # 6. 점심시간 양방향 파싱 (휴게시간 13:00~14:00 및 13:00~14:00 휴게시간 대응)
     lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', cleaned_text)
-    if lunch_match:
+    if not lunch_match:
+        lunch_match = re.search(r'(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})[^\n]*(휴게시간|점심시간|휴게|점심|브레이크)', cleaned_text)
+        if lunch_match:
+            flags['lunch_time'] = f"{lunch_match.group(1)} ~ {lunch_match.group(2)}"
+    else:
         flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 7. 특화진료 항목 파싱
+    # 7. 특화진료 항목 파싱 (정밀 패턴 매칭)
     t = cleaned_text
     n = name.lower()
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
     flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
-    flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
-    flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
+    flags['has_night'] = 1 if re.search(r'(야간진료|야간\s*진료|20:00|21:00|밤진료)', t) else 0
+    flags['has_365'] = 1 if re.search(r'(365일|365진료|연중무휴|매일\s*진료)', t) else 0
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
     flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
