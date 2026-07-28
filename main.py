@@ -155,7 +155,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (실시간 상태 오탐 방지 완벽 적용)
+# 6. 텍스트 분석 및 플래그 매핑 (실시간 상태 오탐 방지 적용)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -175,15 +175,14 @@ def parse_flags(text, raw_html, name=""):
     
     raw_combined = (text + " " + raw_html).lower()
     
-    # 💡 1. 네이버 실시간 영업 상태 가변 문구 사전 제거 (오탐 원천 차단)
-    # 예: "진료 전", "영업 전", "진료 마감", "09:00에 영업 시작", "곧 영업 종료" 등
+    # 1. 네이버 실시간 영업 상태 가변 문구 사전 제거 (진료전/영업전으로 인한 오탐 방지)
     status_patterns = r'(\b진료\s*전\b|\b영업\s*전\b|\b진료\s*마감\b|\b영업\s*마감\b|\b접수\s*마감\b|\d{1,2}:\d{2}\b에\s*(진료|영업)\s*시작|곧\s*(진료|영업)\s*종료)'
     cleaned_text = re.sub(status_patterns, '', raw_combined)
     
-    # 💡 2. "오늘"이라는 텍스트를 현재 KST 요일로 치환
+    # 2. "오늘" 문구를 현재 KST 요일로 치환
     cleaned_text = cleaned_text.replace("오늘", today_str)
     
-    # 💡 3. 한방 / 양방 / 한양방 구분값 판별
+    # 3. 한방 / 양방 / 한양방 구분값 판별
     flags['is_hanbang'] = determine_hanbang_type(name, cleaned_text)
     
     schedule = {
@@ -192,7 +191,7 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 💡 4. 요일별 시간 패턴 매칭 정규식
+    # 4. 요일별 시간 패턴 매칭
     time_pattern = re.compile(
         r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심시간|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기\s*휴무)'
     )
@@ -216,13 +215,13 @@ def parse_flags(text, raw_html, name=""):
         elif '점심' in key:
             schedule['점심시간'] = val
 
-    # 💡 5. 요일별 휴무 명확 매칭 (단순 '휴무' 키워드가 아닌 해당 요일 직후의 휴무만 파싱)
+    # 5. 요일별 휴무 명확 매칭 (단순 '휴무' 키워드가 아닌 요일 직후의 휴무 표현만 구별)
     for day in weekdays:
         if schedule[day] == '정보 없음':
             if re.search(fr'{day}\s*[:]?\s*(휴무|휴진|정기휴무|정기\s*휴무)', cleaned_text):
                 schedule[day] = '휴무'
 
-    # 💡 6. business_hours 포맷 조립
+    # 6. business_hours 문자열 포맷 조립
     formatted_hours = []
     for day in weekdays:
         if schedule[day] != '정보 없음':
@@ -233,7 +232,7 @@ def parse_flags(text, raw_html, name=""):
         
     flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
-    # 💡 7. 점심시간 파싱
+    # 7. 점심시간 파싱
     if schedule['점심시간']:
         flags['lunch_time'] = schedule['점심시간']
     else:
@@ -241,7 +240,7 @@ def parse_flags(text, raw_html, name=""):
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 💡 8. 특화진료 항목 파싱
+    # 8. 특화진료 항목 파싱
     t = cleaned_text
     n = name.lower()
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
@@ -272,15 +271,15 @@ def parse_flags(text, raw_html, name=""):
 # 7. 메인 파이프라인 실행
 # ---------------------------------------------------------------------------
 def main():
-    LIMIT = 90
+    LIMIT = 100  # 회당 100개 수집 (하루 12회 실행시 총 1,200개 처리)
     print(f"\n🔍 [DB 연결] 클라우드플레어 D1에서 타겟 병의원 {LIMIT}개 조회 중...")
     
-    # 전국의 모든 의료기관 대상으로 미수집/오래된 항목 순차 업데이트
+    # 💡 [옵션 A]: 날짜 제한을 완전히 풀고, 오랫동안 갱신되지 않은 순서대로 무조건 순환 갱신
     sql_select = f"""
         SELECT id, name, address 
         FROM hospitals 
-        WHERE (description IS NULL OR updated_at < datetime('now', '-30 days')) 
-        ORDER BY updated_at ASC LIMIT {LIMIT}
+        ORDER BY updated_at ASC 
+        LIMIT {LIMIT}
     """
     hospitals = execute_d1_query(sql_select)
     
@@ -364,7 +363,8 @@ def main():
                 print(f"    ⚠️ [최종 수집 실패] 모든 검색 단계를 거쳤으나 찾지 못해 'N/A' (기본구분: {fallback_type}) 처리했습니다.")
                 print("-" * 70)
 
-            time.sleep(random.uniform(2.5, 4.0))
+            # 💡 [딜레이 2배 적용]: 5.0초 ~ 8.0초 안전 대기
+            time.sleep(random.uniform(5.0, 8.0))
 
         browser.close()
 
