@@ -205,7 +205,7 @@ def parse_flags(text, raw_html, name=""):
     normalized_text = re.sub(r'(\d{1,2})\s*시\s*(\d{1,2})\s*분', r'\1:\2', normalized_text)
     normalized_text = re.sub(r'(\d{1,2})\s*시', r'\1:00', normalized_text)
     
-    # 상단 요약 문구 제거
+    # 상단 가변 요약 문구 제거
     status_patterns = r'((오늘|월요일|화요일|수요일|목요일|금요일|토요일|일요일)\s*(휴무|휴진|영업\s*전|진료\s*전|진료\s*마감|영업\s*마감)|\b진료\s*전\b|\b영업\s*전\b|\b진료\s*마감\b|\b영업\s*마감\b|\b접수\s*마감\b|\d{1,2}:\d{2}\b에\s*(진료|영업)\s*시작|곧\s*(진료|영업)\s*종료)'
     cleaned_text = re.sub(status_patterns, '', normalized_text)
     cleaned_text = cleaned_text.replace("오늘", today_str)
@@ -218,7 +218,7 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 💡 1차: 요일/평일 시간대 추출
+    # 💡 1차: 요일/평일 시간대 추출 (시간 표현 뒤 공백 정규화)
     time_range_pattern_long = re.compile(
         r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일)\s*[:]?\s*(\d{1,2}:\d{2}\s*(?:부터|~|–|-)\s*\d{1,2}:\d{2})'
     )
@@ -226,7 +226,8 @@ def parse_flags(text, raw_html, name=""):
     
     for match in long_matches:
         key = match[0].strip()
-        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~').strip()
+        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~')
+        val = re.sub(r'\s*~\s*', ' ~ ', val).strip()
         
         if key == '평일':
             for d in ['월요일', '화요일', '수요일', '목요일', '금요일']:
@@ -246,7 +247,8 @@ def parse_flags(text, raw_html, name=""):
     for match in short_matches:
         raw_key = match[0].strip()
         key = day_map.get(raw_key)
-        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~').strip()
+        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~')
+        val = re.sub(r'\s*~\s*', ' ~ ', val).strip()
         if key and schedule[key] == '정보 없음':
             schedule[key] = val
 
@@ -271,14 +273,24 @@ def parse_flags(text, raw_html, name=""):
         
     flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
-    # 💡 점심시간 양방향 매칭
+    # 💡 점심시간 정밀 파싱 (시작 시간이 11시~14시 사이일 때만 인정하도록 오탐 차단)
     lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*(?:부터|~|–|-)\s*(\d{1,2}:\d{2})', cleaned_text)
     if not lunch_match:
         lunch_match = re.search(r'(\d{1,2}:\d{2})\s*(?:부터|~|–|-)\s*(\d{1,2}:\d{2})[^\n]*(휴게시간|점심시간|휴게|점심|브레이크)', cleaned_text)
         if lunch_match:
-            flags['lunch_time'] = f"{lunch_match.group(1)} ~ {lunch_match.group(2)}"
+            try:
+                start_h = int(lunch_match.group(1).split(':')[0])
+                if 11 <= start_h <= 14:
+                    flags['lunch_time'] = f"{lunch_match.group(1)} ~ {lunch_match.group(2)}"
+            except Exception:
+                pass
     else:
-        flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
+        try:
+            start_h = int(lunch_match.group(2).split(':')[0])
+            if 11 <= start_h <= 14:
+                flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
+        except Exception:
+            pass
 
     # 💡 특화진료 및 부가정보 오탐 방지 (실제 진료시간 기반 검증)
     t = cleaned_text
@@ -379,7 +391,7 @@ def main():
             if search_success and crawled_text and raw_html and map_url:
                 flags = parse_flags(crawled_text, raw_html, h_name)
                 
-                # [3단계]: D1 DB 저장용 순수 텍스트 500자 절삭
+                # [3단계 반영]: D1 DB 저장용 순수 정제 텍스트 500자 절삭
                 summary_text = crawled_text[:500] 
                 
                 sql_update = """
