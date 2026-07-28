@@ -20,22 +20,31 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Cloudflare D1 SQL 실행 함수
+# 2. Cloudflare D1 SQL 실행 함수 (타임아웃 30초 및 3회 재시도 적용)
 # ---------------------------------------------------------------------------
 def execute_d1_query(sql, params=[]):
     payload = {"sql": sql, "params": params}
-    try:
-        res = requests.post(D1_API_URL, headers=HEADERS, json=payload, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("success"):
-                return data["result"][0].get("results", [])
+    max_retries = 3
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = requests.post(D1_API_URL, headers=HEADERS, json=payload, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("success"):
+                    return data["result"][0].get("results", [])
+                else:
+                    print(f"    ❌ D1 쿼리 실패: {data.get('errors')}")
+                    return None
             else:
-                print(f"    ❌ D1 쿼리 실패: {data.get('errors')}")
-        else:
-            print(f"    ❌ D1 HTTP 에러 [{res.status_code}]: {res.text}")
-    except Exception as e:
-        print(f"    ❌ D1 연결 예외 발생: {e}")
+                print(f"    ❌ D1 HTTP 에러 [{res.status_code}]: {res.text}")
+        except Exception as e:
+            print(f"    ⚠️ D1 통신 시도 ({attempt}/{max_retries}) 실패: {e}")
+            if attempt < max_retries:
+                time.sleep(3.0)  # 3초 대기 후 재시도
+            else:
+                print("    ❌ D1 최대 재시도 횟수 초과로 통신을 포기합니다.")
+                
     return None
 
 # ---------------------------------------------------------------------------
@@ -43,7 +52,7 @@ def execute_d1_query(sql, params=[]):
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
-    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip()  # 다중 공백 정리
     
     addr_parts = address.split() if address else []
     
@@ -83,7 +92,6 @@ def determine_hanbang_type(name, raw_text):
         return "한방"
     
     # 2. 일반 병원 중 완벽히 한양방 협진/한방과 진료가 명시된 경우만 "한양방"
-    # (단순 '협진' 키워드 제외, 정밀 문맥 키워드로 제한)
     strict_hanbang_keywords = r'(한양방\s*협진|양한방\s*협진|한방과\s*진료|한의사\s*진료|한방재활의학과|침구과\s*진료|사상체질과)'
     if re.search(strict_hanbang_keywords, t):
         return "한양방"
@@ -92,7 +100,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 5. Playwright 정밀 크롤링
+# 5. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (아코디언 자동 펼침 포함)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -140,7 +148,6 @@ def crawl_naver_place_with_playwright(query, page):
                 
             combined_text = (home_text + " " + info_text)[:2000]
             
-            # 💡 [원장님 요청 사항] 수집된 크롤링 원본 텍스트 디버깅 출력 (상위 300자)
             preview_text = combined_text.replace('\n', ' ')[:300]
             print(f"    📝 [텍스트 수집 성공 (총 {len(combined_text)}자)]")
             print(f"       📄 미리보기: \"{preview_text}...\"")
@@ -155,7 +162,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (축약 요일 '월/화/수' 지원 포함)
+# 6. 텍스트 분석 및 플래그 매핑 (휴무 오탐 방지 및 축약 요일 파싱)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
