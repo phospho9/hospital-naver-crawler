@@ -42,7 +42,7 @@ def execute_d1_query(sql, params=[]):
 # 3. 4단계 정교한 폴백 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
-    # 💡 '의료법인', '인당의료재단', '재단법인', '사단법인', '(주)', '(유)' 등 껍데기 상호 완벽 제거
+    # '의료법인', '인당의료재단', '재단법인', '사단법인', '(주)', '(유)' 등 껍데기 상호 완벽 제거
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
     clean_name = re.sub(r'\s+', ' ', clean_name).strip()  # 다중 공백 정리
     
@@ -75,13 +75,9 @@ def build_search_queries(name, address):
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 💡 한방 / 양방 / 한양방(협진) 판별 함수
+# 4. 한방 / 양방 / 한양방(협진) 판별 함수
 # ---------------------------------------------------------------------------
 def determine_hanbang_type(name, raw_text):
-    """
-    name: 병원명 (예: 'OOO한의원', 'XX병원')
-    raw_text: 네이버 플레이스 수집 텍스트/HTML
-    """
     n = name.lower()
     t = raw_text.lower() if raw_text else ""
     
@@ -159,7 +155,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (요일 구조화 및 is_hanbang 반영)
+# 6. 텍스트 분석 및 플래그 매핑 (실시간 상태 오탐 방지 완벽 적용)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -177,12 +173,18 @@ def parse_flags(text, raw_html, name=""):
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     today_str = weekdays[today_kst.weekday()]
     
-    t = text.lower().replace("오늘", today_str)
-    raw_html_lower = raw_html.lower().replace("오늘", today_str)
-    n = name.lower()
+    raw_combined = (text + " " + raw_html).lower()
     
-    # 💡 1. 한방 / 양방 / 한양방 구분값 판별
-    flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html_lower)
+    # 💡 1. 네이버 실시간 영업 상태 가변 문구 사전 제거 (오탐 원천 차단)
+    # 예: "진료 전", "영업 전", "진료 마감", "09:00에 영업 시작", "곧 영업 종료" 등
+    status_patterns = r'(\b진료\s*전\b|\b영업\s*전\b|\b진료\s*마감\b|\b영업\s*마감\b|\b접수\s*마감\b|\d{1,2}:\d{2}\b에\s*(진료|영업)\s*시작|곧\s*(진료|영업)\s*종료)'
+    cleaned_text = re.sub(status_patterns, '', raw_combined)
+    
+    # 💡 2. "오늘"이라는 텍스트를 현재 KST 요일로 치환
+    cleaned_text = cleaned_text.replace("오늘", today_str)
+    
+    # 💡 3. 한방 / 양방 / 한양방 구분값 판별
+    flags['is_hanbang'] = determine_hanbang_type(name, cleaned_text)
     
     schedule = {
         '월요일': '정보 없음', '화요일': '정보 없음', '수요일': '정보 없음',
@@ -190,12 +192,18 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    time_pattern = re.compile(r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기휴무)')
-    matches = time_pattern.findall(t + " " + raw_html_lower)
+    # 💡 4. 요일별 시간 패턴 매칭 정규식
+    time_pattern = re.compile(
+        r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심시간|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기\s*휴무)'
+    )
+    
+    matches = time_pattern.findall(cleaned_text)
     
     for match in matches:
         key = match[0].replace('매주 ', '').strip()
-        val = match[1].replace('–', '~').replace('-', '~')
+        val = match[1].replace('–', '~').replace('-', '~').strip()
+        if "정기" in val:
+            val = "휴무"
         
         if key == '평일':
             for d in ['월요일', '화요일', '수요일', '목요일', '금요일']:
@@ -208,37 +216,40 @@ def parse_flags(text, raw_html, name=""):
         elif '점심' in key:
             schedule['점심시간'] = val
 
+    # 💡 5. 요일별 휴무 명확 매칭 (단순 '휴무' 키워드가 아닌 해당 요일 직후의 휴무만 파싱)
     for day in weekdays:
-        if f"{day} 휴무" in t or f"{day} 휴진" in t or f"{day}\n정기휴무" in t:
-            schedule[day] = '휴무'
+        if schedule[day] == '정보 없음':
+            if re.search(fr'{day}\s*[:]?\s*(휴무|휴진|정기휴무|정기\s*휴무)', cleaned_text):
+                schedule[day] = '휴무'
 
+    # 💡 6. business_hours 포맷 조립
     formatted_hours = []
     for day in weekdays:
         if schedule[day] != '정보 없음':
             formatted_hours.append(f"{day}: {schedule[day]}")
-    
+            
     if schedule['공휴일']:
         formatted_hours.append(f"공휴일: {schedule['공휴일']}")
         
     flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
+    # 💡 7. 점심시간 파싱
     if schedule['점심시간']:
         flags['lunch_time'] = schedule['점심시간']
     else:
-        lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', raw_html_lower)
+        lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', cleaned_text)
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 💡 3. 특화진료 항목 파싱
+    # 💡 8. 특화진료 항목 파싱
+    t = cleaned_text
+    n = name.lower()
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
     flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
     flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
-    
-    # 💡 '365', '연중무휴', '매일진료/매일 진료' 키워드만 명확히 감지 (오탐 방지)
     flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
-    
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
     flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
@@ -264,7 +275,7 @@ def main():
     LIMIT = 90
     print(f"\n🔍 [DB 연결] 클라우드플레어 D1에서 타겟 병의원 {LIMIT}개 조회 중...")
     
-    # 💡 전국의 모든 의료기관 대상으로 미수집/오래된 항목 순차 업데이트
+    # 전국의 모든 의료기관 대상으로 미수집/오래된 항목 순차 업데이트
     sql_select = f"""
         SELECT id, name, address 
         FROM hospitals 
@@ -321,7 +332,6 @@ def main():
                 flags = parse_flags(crawled_text, raw_html, h_name)
                 summary_text = crawled_text[:500] 
                 
-                # 💡 is_hanbang 업데이트 파라미터 포함 SQL
                 sql_update = """
                     UPDATE hospitals 
                     SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
@@ -339,13 +349,13 @@ def main():
                 execute_d1_query(sql_update, params)
                 
                 print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
-                print(f"       - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
+                print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
                 if flags['business_hours']:
                     formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
-                    print(f"       - 🕒 진료시간:\n               {formatted_hours}")
-                print(f"       - 🍴 점심시간: {flags['lunch_time']}")
-                print(f"       - 💊 특화진료: 추나({flags['has_chuna']}) 약침({flags['has_yakchim']}) 첩약({flags['is_cheopyak']}) 입원({flags['has_ward']})")
-                print(f"       - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
+                    print(f"        - 🕒 진료시간:\n               {formatted_hours}")
+                print(f"        - 🍴 점심시간: {flags['lunch_time']}")
+                print(f"        - 💊 특화진료: 추나({flags['has_chuna']}) 약침({flags['has_yakchim']}) 첩약({flags['is_cheopyak']}) 입원({flags['has_ward']})")
+                print(f"        - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
                 print("-" * 70)
             else:
                 fallback_type = "한방" if ("한의원" in h_name or "한방병원" in h_name) else "양방"
@@ -358,7 +368,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ 생명마루한의원 안산점 플레이스 상위 노출 분석을 위한 정밀 크롤링이 마무리되었습니다.")
+    print("\n✨ 병의원 플레이스 데이터 수집 및 분석이 성공적으로 마쳐졌습니다.")
 
 if __name__ == "__main__":
     main()
