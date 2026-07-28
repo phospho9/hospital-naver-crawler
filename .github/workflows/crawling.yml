@@ -2,7 +2,9 @@ name: Daily Naver Place Crawler
 
 on:
   schedule:
-    - cron: '0 0,4,8,12,16,20 * * *'
+    # 💡 2시간 간격 실행 (매 30분 - 정시 실행 대기 지연 방지)
+    # UTC 기준 00:30, 02:30, 04:30 ... -> KST 기준 09:30, 11:30, 13:30 ... (하루 12회)
+    - cron: '30 */2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 💡 [필수 추가] Playwright가 리눅스 환경(Ubuntu)에서 크롬을 띄우기 위해 필요한 브라우저 및 의존성 설치 단계
+      # 💡 Playwright 리눅스 실행용 브라우저 및 패키지 의존성 설치
       - name: Install Playwright Browsers
         run: playwright install --with-deps chromium
 
