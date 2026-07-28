@@ -41,18 +41,18 @@ def execute_d1_query(sql, params=[]):
         except Exception as e:
             print(f"    ⚠️ D1 통신 시도 ({attempt}/{max_retries}) 실패: {e}")
             if attempt < max_retries:
-                time.sleep(3.0)  # 3초 대기 후 재시도
+                time.sleep(3.0)
             else:
                 print("    ❌ D1 최대 재시도 횟수 초과로 통신을 포기합니다.")
                 
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 4단계 정교한 폴백 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
+# 3. 4단계 정교한 폴백 검색 키워드 생성 함수
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
-    clean_name = re.sub(r'\s+', ' ', clean_name).strip()  # 다중 공백 정리
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
     
     addr_parts = address.split() if address else []
     
@@ -87,24 +87,20 @@ def determine_hanbang_type(name, raw_text):
     n = name.lower()
     t = raw_text.lower() if raw_text else ""
     
-    # 1. 병원명에 '한의원' 또는 '한방병원'이 들어가면 100% "한방"
     if "한의원" in n or "한방병원" in n:
         return "한방"
     
-    # 2. 병원명 자체에 '한양방' 또는 '협진'이 명시되어 있으면 "한양방"
     if "한양방" in n or "양한방" in n or "협진" in n:
         return "한양방"
     
-    # 3. 주변 탭 오염 방지: 병원이 '직접' 명시한 한방/협진 문구만 인정
     strict_hanbang_keywords = r'(한양방\s*협진\s*병원|양한방\s*협진\s*병원|한양방\s*통합|본\s*병원은\s*한방|한방과\s*설치|한방진료실|한의사\s*상주)'
     if re.search(strict_hanbang_keywords, t):
         return "한양방"
     
-    # 4. 그 외 모든 일반 양방 병원/의원/산부인과/정형외과는 "양방"
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 5. Playwright 정밀 크롤링 (앞쪽 UI 노이즈 절단 & 6000자 수집)
+# 5. Playwright 정밀 크롤링 (1단계: 상단/하단 노이즈 절단)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -129,7 +125,6 @@ def crawl_naver_place_with_playwright(query, page):
             page.goto(navermap_url, timeout=15000)
             page.wait_for_timeout(2000)
             
-            # 아코디언(펼쳐보기, 더보기 등) 클릭
             try:
                 expand_buttons = page.locator("text=펼쳐보기, text=더보기, text=영업시간 수정 제안하기, .group_fold")
                 for i in range(expand_buttons.count()):
@@ -153,8 +148,8 @@ def crawl_naver_place_with_playwright(query, page):
                 
             raw_combined = home_text + "\n" + info_text
             
-            # [전반부 UI 쓰레기 텍스트 절단]
-            cut_keywords = ["주소", "영업시간", "홈 리뷰 사진 지도", "전화번호"]
+            # [1단계]: 상단 UI 노이즈 절단 (소개, 진료시간, 주소, 영업시간 시작 지점 탐색)
+            cut_keywords = ["[ 진료시간 ]", "진료시간", "소개", "주소", "영업시간", "전화번호"]
             cut_index = -1
             for kw in cut_keywords:
                 idx = raw_combined.find(kw)
@@ -162,16 +157,18 @@ def crawl_naver_place_with_playwright(query, page):
                     if cut_index == -1 or idx < cut_index:
                         cut_index = idx
             
-            if cut_index != -1 and cut_index > 50:
-                cleaned_combined = raw_combined[cut_index:]
-            else:
-                cleaned_combined = raw_combined
-                
-            # 테스트 및 정밀 파싱용 6,000자 확보
-            combined_text = cleaned_combined[:6000]
+            cleaned = raw_combined[cut_index:] if (cut_index != -1 and cut_index > 30) else raw_combined
 
-            print(f"    📝 [텍스트 수집 성공 (노이즈 제거 후 총 {len(combined_text)}자)]")
-            print(f"       📄 전체 수집내용 보기:\n\"{combined_text}\"\n")
+            # [1단계]: 하단 푸터/약관/캡차 절단
+            end_keywords = ["알고 계신 정보와 다른 정보가 있나요?", "사진으로 간단하게 제보해 주세요", "이용약관고객센터", "Please complete the security", "Copyright © NAVER"]
+            for ekw in end_keywords:
+                e_idx = cleaned.find(ekw)
+                if e_idx != -1:
+                    cleaned = cleaned[:e_idx]
+
+            combined_text = cleaned.strip()[:1500]
+
+            print(f"    📝 [텍스트 정제 완료 (노이즈 제거 후 총 {len(combined_text)}자)]")
             
             return combined_text, raw_html, navermap_url, True
         else:
@@ -183,7 +180,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑 (중복 매칭 및 점심시간 패턴 보완)
+# 6. 텍스트 분석 및 플래그 매핑 (2단계: 진료시간/휴진/점심시간 정밀 파싱)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -203,12 +200,16 @@ def parse_flags(text, raw_html, name=""):
     
     raw_combined = (text + " " + raw_html).lower()
     
-    # 1. 상단 가변 요약 문구 사전 제거
+    # 💡 한글 시/분 표현 및 '평 일' 띄어쓰기 정규화 전처리
+    normalized_text = re.sub(r'평\s*일', '평일', raw_combined)
+    normalized_text = re.sub(r'(\d{1,2})\s*시\s*(\d{1,2})\s*분', r'\1:\2', normalized_text)
+    normalized_text = re.sub(r'(\d{1,2})\s*시', r'\1:00', normalized_text)
+    
+    # 상단 요약 문구 제거
     status_patterns = r'((오늘|월요일|화요일|수요일|목요일|금요일|토요일|일요일)\s*(휴무|휴진|영업\s*전|진료\s*전|진료\s*마감|영업\s*마감)|\b진료\s*전\b|\b영업\s*전\b|\b진료\s*마감\b|\b영업\s*마감\b|\b접수\s*마감\b|\d{1,2}:\d{2}\b에\s*(진료|영업)\s*시작|곧\s*(진료|영업)\s*종료)'
-    cleaned_text = re.sub(status_patterns, '', raw_combined)
+    cleaned_text = re.sub(status_patterns, '', normalized_text)
     cleaned_text = cleaned_text.replace("오늘", today_str)
     
-    # 2. 정밀 한방/양방/한양방 판별
     flags['is_hanbang'] = determine_hanbang_type(name, cleaned_text)
     
     schedule = {
@@ -217,16 +218,15 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 3. 요일시간 정밀 매칭 (긴 요일명 우선 추출)
-    # 1차: '월요일'~'일요일' 3글자 전체 매칭
+    # 💡 1차: 요일/평일 시간대 추출
     time_range_pattern_long = re.compile(
-        r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2})'
+        r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일)\s*[:]?\s*(\d{1,2}:\d{2}\s*(?:부터|~|–|-)\s*\d{1,2}:\d{2})'
     )
     long_matches = time_range_pattern_long.findall(cleaned_text)
     
     for match in long_matches:
         key = match[0].strip()
-        val = match[1].replace('–', '~').replace('-', '~').strip()
+        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~').strip()
         
         if key == '평일':
             for d in ['월요일', '화요일', '수요일', '목요일', '금요일']:
@@ -237,54 +237,68 @@ def parse_flags(text, raw_html, name=""):
         elif '공휴일' in key:
             schedule['공휴일'] = val
 
-    # 2차: 1차에서 잡히지 않은 요일에 한해 단축 요일('월'~'일') 매칭
+    # 단축 요일 (월~일) 2차 파싱
     day_map = {'월': '월요일', '화': '화요일', '수': '수요일', '목': '목요일', '금': '금요일', '토': '토요일', '일': '일요일'}
     time_range_pattern_short = re.compile(
-        r'(?:^|\s)(월|화|수|목|금|토|일)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2})'
+        r'(?:^|\s)(월|화|수|목|금|토|일)\s*[:]?\s*(\d{1,2}:\d{2}\s*(?:부터|~|–|-)\s*\d{1,2}:\d{2})'
     )
     short_matches = time_range_pattern_short.findall(cleaned_text)
     for match in short_matches:
         raw_key = match[0].strip()
         key = day_map.get(raw_key)
-        val = match[1].replace('–', '~').replace('-', '~').strip()
+        val = match[1].replace('부터', '~').replace('–', '~').replace('-', '~').strip()
         if key and schedule[key] == '정보 없음':
             schedule[key] = val
 
-    # 4. 시간 미파싱 요일 정기휴무 검사
+    # 💡 2차: "일요일 및 공휴일 휴진" 문구 정밀 탐지
+    if re.search(r'일요일\s*(?:및|/|,|\w+)*\s*공휴일\s*(?:휴진|휴무)', cleaned_text) or re.search(r'일요일\s*휴진', cleaned_text):
+        schedule['일요일'] = '휴무'
+        schedule['공휴일'] = '휴무'
+        
     for day in weekdays:
         if schedule[day] == '정보 없음':
             short_day = day[0]
             if re.search(fr'({day}|{short_day})\s*[:]?\s*(정기\s*휴무|휴무|휴진)', cleaned_text):
                 schedule[day] = '휴무'
 
-    # 5. 진료시간 포맷 조립
     formatted_hours = []
     for day in weekdays:
         if schedule[day] != '정보 없음':
             formatted_hours.append(f"{day}: {schedule[day]}")
             
-    if schedule['공휴일']:
+    if schedule['공휴일'] and schedule['공휴일'] != '휴무':
         formatted_hours.append(f"공휴일: {schedule['공휴일']}")
         
     flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
     
-    # 6. 점심시간 양방향 파싱 (휴게시간 13:00~14:00 및 13:00~14:00 휴게시간 대응)
-    lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', cleaned_text)
+    # 💡 점심시간 양방향 매칭
+    lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*(?:부터|~|–|-)\s*(\d{1,2}:\d{2})', cleaned_text)
     if not lunch_match:
-        lunch_match = re.search(r'(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})[^\n]*(휴게시간|점심시간|휴게|점심|브레이크)', cleaned_text)
+        lunch_match = re.search(r'(\d{1,2}:\d{2})\s*(?:부터|~|–|-)\s*(\d{1,2}:\d{2})[^\n]*(휴게시간|점심시간|휴게|점심|브레이크)', cleaned_text)
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(1)} ~ {lunch_match.group(2)}"
     else:
         flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 7. 특화진료 항목 파싱 (정밀 패턴 매칭)
+    # 💡 특화진료 및 부가정보 오탐 방지 (실제 진료시간 기반 검증)
     t = cleaned_text
     n = name.lower()
+    
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
     flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
-    flags['has_night'] = 1 if re.search(r'(야간진료|야간\s*진료|20:00|21:00|밤진료)', t) else 0
+    
+    # 야간진료: 20시 이후 진료시간 존재 또는 '야간진료' 어휘 명시
+    has_night_time = False
+    if flags['business_hours']:
+        times = re.findall(r'~\s*(\d{1,2}):(\d{2})', flags['business_hours'])
+        for end_h, _ in times:
+            if int(end_h) >= 20:
+                has_night_time = True
+                break
+    flags['has_night'] = 1 if has_night_time or re.search(r'(야간진료|야간\s*진료|밤진료)', t) else 0
+    
     flags['has_365'] = 1 if re.search(r'(365일|365진료|연중무휴|매일\s*진료)', t) else 0
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
@@ -364,6 +378,8 @@ def main():
             
             if search_success and crawled_text and raw_html and map_url:
                 flags = parse_flags(crawled_text, raw_html, h_name)
+                
+                # [3단계]: D1 DB 저장용 순수 텍스트 500자 절삭
                 summary_text = crawled_text[:500] 
                 
                 sql_update = """
