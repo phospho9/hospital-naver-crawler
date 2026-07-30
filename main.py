@@ -39,7 +39,7 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 4단계 정교한 폴백 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
+# 3. 4단계 검색 키워드 생성 함수
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
@@ -72,38 +72,7 @@ def build_search_queries(name, address):
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 리뷰어 닉네임 및 UI 껍데기 문구 최소 가공 함수 (글자 수 절삭 절대 금지!)
-# ---------------------------------------------------------------------------
-def clean_noise_text(raw_text, hospital_name=""):
-    if not raw_text:
-        return ""
-        
-    text = raw_text
-    
-    # 🎯 1. 네이버 모바일 플레이스 버튼/UI 레이아웃 단어 걷어내기
-    ui_noises = [
-        r'이전 페이지', r'마이플레이스', r'지도내비게이션거리뷰', r'내비게이션', r'거리뷰',
-        r'펼쳐보기', r'내용 더보기', r'정보 더보기', r'더보기', r'복사', r'공유', r'길찾기',
-        r'전화', r'문의', r'고유가 피해지원금', r'리뷰 \d+', r'저장', r'사진', r'지도', r'주변'
-    ]
-    for noise in ui_noises:
-        text = re.sub(noise, ' ', text)
-        
-    # 🎯 2. '이세상모든것5', '헬스왕232' 등 리뷰어 닉네임 및 캡션 연속 중복 억제 (1개만 남김)
-    text = re.sub(r'(\b\w+\b)(?:\s+\1)+', r'\1', text)
-    
-    # 🎯 3. 헤더 상단 병원 이름 3회 이상 무의미 중복 제거
-    if hospital_name:
-        clean_h_name = re.escape(hospital_name)
-        text = re.sub(rf'({clean_h_name}\s*){{2,}}', f'{hospital_name} ', text)
-        
-    # 다중 공백 정리 (글자 자르기는 하지 않음!)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
-
-# ---------------------------------------------------------------------------
-# 5. 한방 / 양방 / 한양방(협진) 판별 함수
+# 4. 한방 / 양방 / 한양방(협진) 판별 함수 (Raw 텍스트 기반)
 # ---------------------------------------------------------------------------
 def determine_hanbang_type(name, raw_text):
     n = name.lower()
@@ -119,7 +88,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 6. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (무제한 Raw 텍스트 수집)
+# 5. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (순수 Raw 텍스트 수집)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -165,10 +134,10 @@ def crawl_naver_place_with_playwright(query, page):
             except Exception:
                 info_text = ""
                 
-            # 💡 글자 수 제한 없이(No Slicing) 전체 원문 그대로 결합
-            raw_text = home_text + " " + info_text
+            # 💡 [PURE RAW] 가공/절삭/정제 0% - 화면 전체 텍스트 결합
+            pure_raw_text = home_text + "\n" + info_text
             
-            return raw_text, raw_html, navermap_url, True
+            return pure_raw_text, raw_html, navermap_url, True
         else:
             print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
             return None, html_content, search_url, False
@@ -178,7 +147,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 7. 텍스트 분석 및 플래그 매핑
+# 6. 텍스트 분석 및 플래그 매핑
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -270,7 +239,7 @@ def parse_flags(text, raw_html, name=""):
     return flags
 
 # ---------------------------------------------------------------------------
-# 8. 메인 파이프라인 실행
+# 7. 메인 파이프라인 실행
 # ---------------------------------------------------------------------------
 def main():
     LIMIT = 100
@@ -312,7 +281,7 @@ def main():
             
             query_list = build_search_queries(h_name, h_addr)
             
-            raw_text, raw_html, map_url = None, None, None
+            pure_raw_text, raw_html, map_url = None, None, None
             search_success = False
             
             for step, query in enumerate(query_list, 1):
@@ -320,7 +289,7 @@ def main():
                 rt, html, url, is_success = crawl_naver_place_with_playwright(query, page)
                 
                 if is_success:
-                    raw_text, raw_html, map_url = rt, html, url
+                    pure_raw_text, raw_html, map_url = rt, html, url
                     search_success = True
                     break
                 else:
@@ -328,16 +297,11 @@ def main():
                         print("    🔄 [검색 실패] 다음 단계 검색어로 재시도합니다.")
                         time.sleep(1.0)
             
-            if search_success and raw_text and raw_html and map_url:
-                # 🎯 최소 정제: 리뷰어 닉네임 중복 및 UI 껍데기만 살짝거두고 전체 텍스트 수집
-                cleaned_text = clean_noise_text(raw_text, h_name)
+            if search_success and pure_raw_text and raw_html and map_url:
+                # Raw 텍스트 그대로 속성 분석 진행
+                flags = parse_flags(pure_raw_text, raw_html, h_name)
                 
-                # 정제된 전체 텍스트 기반으로 속성 분석
-                flags = parse_flags(cleaned_text, raw_html, h_name)
-                
-                # 💡 [핵심] 글자 수 절삭([:500]) 완벽 삭제! 전체 정제본 통째로 DB 저장
-                db_summary_text = cleaned_text 
-                
+                # 💡 [100% PURE RAW] 어떠한 필터링/가공/절삭 없이 그대로 DB 저장
                 sql_update = """
                     UPDATE hospitals 
                     SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
@@ -347,24 +311,20 @@ def main():
                     WHERE id = ?
                 """
                 params = [
-                    db_summary_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
+                    pure_raw_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
                     flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'],
                     flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'],
                     flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # 무축약 검증 로그
-                print("\n    ===================== 📝 데이터 무제한 보존 검증 로그 =====================")
-                print(f"    1️⃣ [크롤링한 100% 원본 Raw 텍스트 (총 {len(raw_text)}자)]")
-                print(f"       👉 {raw_text}")
-                print(f"\n    2️⃣ [닉네임/UI 노이즈만 가볍게 정제한 100% 텍스트 (총 {len(cleaned_text)}자)]")
-                print(f"       👉 {cleaned_text}")
-                print(f"\n    3️⃣ [DB에 최종 저장된 description (절삭 0%, 총 {len(db_summary_text)}자 보존)]")
-                print(f"       👉 {db_summary_text}")
-                print("    =================================================================================\n")
+                # Pure Raw 텍스트 무축약 출력
+                print("\n    ===================== 📝 Pure Raw 텍스트 검증 로그 =====================")
+                print(f"    📄 [화면에서 추출된 무가공 Raw 텍스트 100% (총 {len(pure_raw_text)}자)]")
+                print(f"    👉 {pure_raw_text}")
+                print("    ========================================================================\n")
                 
-                print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
+                print("    ✅ [저장 성공] DB에 Pure Raw Data 업데이트가 완료되었습니다.")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
                 if flags['business_hours']:
                     formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
@@ -384,7 +344,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ 원본 무손실 보존 정책이 반영된 정밀 크롤링이 완료되었습니다.")
+    print("\n✨ 화면 노출 원문 100% 그대로 수집이 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
