@@ -42,9 +42,8 @@ def execute_d1_query(sql, params=[]):
 # 3. 4단계 정교한 폴백 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
-    # '의료법인', '인당의료재단', '재단법인', '사단법인', '(주)', '(유)' 등 껍데기 상호 완벽 제거
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
-    clean_name = re.sub(r'\s+', ' ', clean_name).strip()  # 다중 공백 정리
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
     
     addr_parts = address.split() if address else []
     
@@ -53,7 +52,6 @@ def build_search_queries(name, address):
     city_gun = addr_parts[1] if len(addr_parts) > 1 else ""
     detail_addr = addr_parts[2] if len(addr_parts) > 2 else ""
     
-    # 1차: 순수 상호명 + 시/도 + 시/군/구 (예: 해운대부민병원 부산광역시 해운대구)
     if province and city_gun:
         queries.append(f"{clean_name} {province} {city_gun}")
     if city_gun:
@@ -63,7 +61,6 @@ def build_search_queries(name, address):
     if detail_addr:
         queries.append(f"{clean_name} {detail_addr}")
         
-    # 4차 (최종 폴백): 순수 상호명만 (예: 해운대부민병원)
     queries.append(clean_name)
     
     unique_queries = []
@@ -81,16 +78,13 @@ def determine_hanbang_type(name, raw_text):
     n = name.lower()
     t = raw_text.lower() if raw_text else ""
     
-    # 1. 명칭에 '한의원' 또는 '한방병원'이 명시되어 있으면 100% "한방"
     if "한의원" in n or "한방병원" in n:
         return "한방"
     
-    # 2. 일반 양방 병원/요양병원/의원 중 한의사/한방진료/협진 키워드가 검출되면 "한양방"
-    hanbang_keywords = r'(한의사|한방과|한방진료|한양방|한·양방|양한방|한양방협진|협진병원|협진진료|한방재활|침구과|사상체질)'
+    hanbang_keywords = r'(한의사|한방과|한방진료|한양방|한·양방|양한방|한양방협진|협진병원|협진진료|한방재활|침구과|사상체질|한방내과)'
     if re.search(hanbang_keywords, t):
         return "한양방"
     
-    # 3. 그 외 기본은 "양방"
     return "양방"
 
 # ---------------------------------------------------------------------------
@@ -119,7 +113,6 @@ def crawl_naver_place_with_playwright(query, page):
             page.goto(navermap_url, timeout=15000)
             page.wait_for_timeout(2000)
             
-            # 아코디언(펼쳐보기, 더보기 등) 자동 클릭하여 숨겨진 주간 시간표 노출
             try:
                 expand_buttons = page.locator("text=펼쳐보기, text=더보기, text=영업시간 수정 제안하기, .group_fold")
                 for i in range(expand_buttons.count()):
@@ -141,11 +134,12 @@ def crawl_naver_place_with_playwright(query, page):
             except Exception:
                 info_text = ""
                 
-            # 💡 [1단계] 처음 가져온 Raw 텍스트 (최대 2000자)
-            raw_text = (home_text + " " + info_text)[:2000]
+            # 1단계: 크롤링한 전체 Raw 텍스트
+            raw_text = home_text + " " + info_text
             
-            # 💡 [2단계] UI 노이즈 제거 후 모든 글자
-            cleaned_text = re.sub(r'(네이버 플레이스|마이플레이스|리뷰 \d+|길찾기|공유|전화|문의|홈|사진|지도|주변 정보|고유가 피해지원금|거리뷰|내비게이션)', ' ', raw_text)
+            # 2단계: UI 노이즈 제거 (네이버 모바일 껍데기 문구 및 리뷰어 ID 패턴 제거 강화)
+            noise_pattern = r'(네이버 플레이스|마이플레이스|이전 페이지|저장|길찾기|공유|전화|문의|홈|사진|지도|주변|정보|고유가 피해지원금|거리뷰|내비게이션|리뷰 \d+|내용 더보기)'
+            cleaned_text = re.sub(noise_pattern, ' ', raw_text)
             cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
             
             return raw_text, cleaned_text, raw_html, navermap_url, True
@@ -175,7 +169,6 @@ def parse_flags(text, raw_html, name=""):
     raw_html_lower = raw_html.lower()
     n = name.lower()
     
-    # 1. 한방 / 양방 / 한양방 구분값 판별
     flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html_lower)
     
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
@@ -185,7 +178,6 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 2. 요일별 영업시간 패턴 정밀 매칭
     time_pattern = re.compile(r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기휴무)')
     matches = time_pattern.findall(t + " " + raw_html_lower)
     
@@ -204,7 +196,6 @@ def parse_flags(text, raw_html, name=""):
         elif '점심' in key:
             schedule['점심시간'] = val
 
-    # 3. 휴무 명확 체크
     for day in weekdays:
         if schedule[day] == '정보 없음':
             if re.search(rf'{day}\s*(정기)?(휴무|휴진)', t):
@@ -227,7 +218,6 @@ def parse_flags(text, raw_html, name=""):
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 4. 특화진료 항목 파싱
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
@@ -315,7 +305,7 @@ def main():
             if search_success and cleaned_text and raw_html and map_url:
                 flags = parse_flags(cleaned_text, raw_html, h_name)
                 
-                # 💡 [3단계] DB에 최종 저장되는 500자
+                # DB 저장용 500자 절삭
                 db_summary_text = cleaned_text[:500] 
                 
                 sql_update = """
@@ -334,15 +324,15 @@ def main():
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # 💡 3단계 텍스트 추출 검증 로그 시각화
-                print("\n    ===================== 📝 3단계 텍스트 비교 로그 =====================")
-                print(f"    1️⃣ [처음 가져온 Raw 텍스트 ({len(raw_text)}자)]")
-                print(f"       👉 \"{raw_text[:200]}...\"")
-                print(f"    2️⃣ [UI 노이즈 제거 후 전체 텍스트 ({len(cleaned_text)}자)]")
-                print(f"       👉 \"{cleaned_text[:200]}...\"")
-                print(f"    3️⃣ [DB에 최종 저장된 500자 (description)]")
-                print(f"       👉 \"{db_summary_text}\"")
-                print("    ======================================================================\n")
+                # 💡 [핵심 교정] 축약(...) 없이 100% 전 문장 그대로 노출하는 3단계 무축약 검증 로그
+                print("\n    ===================== 📝 3단계 텍스트 비교 로그 (전체 출력) =====================")
+                print(f"    1️⃣ [처음 가져온 Raw 텍스트 (총 {len(raw_text)}자)]")
+                print(f"       👉 {raw_text}")
+                print(f"\n    2️⃣ [UI 노이즈 제거 후 전체 텍스트 (총 {len(cleaned_text)}자)]")
+                print(f"       👉 {cleaned_text}")
+                print(f"\n    3️⃣ [DB에 최종 저장된 500자 (description)]")
+                print(f"       👉 {db_summary_text}")
+                print("    =================================================================================\n")
                 
                 print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
@@ -364,7 +354,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ 생명마루한의원 안산점 플레이스 상위 노출 분석을 위한 정밀 크롤링이 마무리되었습니다.")
+    print("\n✨ 플레이스 크롤링 및 로그 출력이 마무리되었습니다.")
 
 if __name__ == "__main__":
     main()
