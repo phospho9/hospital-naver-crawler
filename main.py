@@ -141,22 +141,21 @@ def crawl_naver_place_with_playwright(query, page):
             except Exception:
                 info_text = ""
                 
-            combined_text = (home_text + " " + info_text)[:2000]
+            # 💡 [1단계] 처음 가져온 Raw 텍스트 (최대 2000자)
+            raw_text = (home_text + " " + info_text)[:2000]
             
-            # 노이즈 문구 정제
-            cleaned_text = re.sub(r'(네이버 플레이스|마이플레이스|리뷰 \d+|길찾기|공유|전화|문의|홈|사진|지도|주변 정보|고유가 피해지원금|거리뷰|내비게이션)', ' ', combined_text)
+            # 💡 [2단계] UI 노이즈 제거 후 모든 글자
+            cleaned_text = re.sub(r'(네이버 플레이스|마이플레이스|리뷰 \d+|길찾기|공유|전화|문의|홈|사진|지도|주변 정보|고유가 피해지원금|거리뷰|내비게이션)', ' ', raw_text)
             cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
             
-            print(f"    📝 [텍스트 정제 완료 (총 {len(cleaned_text)}자)]")
-            
-            return cleaned_text, raw_html, navermap_url, True
+            return raw_text, cleaned_text, raw_html, navermap_url, True
         else:
             print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
-            return html_content[:1000], html_content, search_url, False
+            return None, None, html_content, search_url, False
             
     except Exception as e:
         print(f"    ❌ 크롤링 중 예외 발생: {e}")
-        return None, None, None, False
+        return None, None, None, None, False
 
 # ---------------------------------------------------------------------------
 # 6. 텍스트 분석 및 플래그 매핑
@@ -176,7 +175,7 @@ def parse_flags(text, raw_html, name=""):
     raw_html_lower = raw_html.lower()
     n = name.lower()
     
-    # 💡 1. 한방 / 양방 / 한양방 구분값 판별
+    # 1. 한방 / 양방 / 한양방 구분값 판별
     flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html_lower)
     
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
@@ -186,7 +185,7 @@ def parse_flags(text, raw_html, name=""):
         '일요일': '정보 없음', '공휴일': '', '점심시간': ''
     }
     
-    # 💡 2. 요일별 영업시간 패턴 정밀 매칭
+    # 2. 요일별 영업시간 패턴 정밀 매칭
     time_pattern = re.compile(r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기휴무)')
     matches = time_pattern.findall(t + " " + raw_html_lower)
     
@@ -205,7 +204,7 @@ def parse_flags(text, raw_html, name=""):
         elif '점심' in key:
             schedule['점심시간'] = val
 
-    # 💡 3. 휴무 명확 체크
+    # 3. 휴무 명확 체크
     for day in weekdays:
         if schedule[day] == '정보 없음':
             if re.search(rf'{day}\s*(정기)?(휴무|휴진)', t):
@@ -228,16 +227,14 @@ def parse_flags(text, raw_html, name=""):
         if lunch_match:
             flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
-    # 💡 4. 특화진료 항목 파싱
+    # 4. 특화진료 항목 파싱
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
     flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
     flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
     
-    # '365', '연중무휴', '매일진료/매일 진료' 키워드만 명확히 감지
     flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
-    
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
     flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
@@ -299,15 +296,15 @@ def main():
             
             query_list = build_search_queries(h_name, h_addr)
             
-            crawled_text, raw_html, map_url = None, None, None
+            raw_text, cleaned_text, raw_html, map_url = None, None, None, None
             search_success = False
             
             for step, query in enumerate(query_list, 1):
                 print(f"    - {step}차 검색 키워드: {query}")
-                text, html, url, is_success = crawl_naver_place_with_playwright(query, page)
+                rt, ct, html, url, is_success = crawl_naver_place_with_playwright(query, page)
                 
                 if is_success:
-                    crawled_text, raw_html, map_url = text, html, url
+                    raw_text, cleaned_text, raw_html, map_url = rt, ct, html, url
                     search_success = True
                     break
                 else:
@@ -315,9 +312,11 @@ def main():
                         print("    🔄 [검색 실패] 다음 단계 검색어로 재시도합니다.")
                         time.sleep(1.0)
             
-            if search_success and crawled_text and raw_html and map_url:
-                flags = parse_flags(crawled_text, raw_html, h_name)
-                summary_text = crawled_text[:500] 
+            if search_success and cleaned_text and raw_html and map_url:
+                flags = parse_flags(cleaned_text, raw_html, h_name)
+                
+                # 💡 [3단계] DB에 최종 저장되는 500자
+                db_summary_text = cleaned_text[:500] 
                 
                 sql_update = """
                     UPDATE hospitals 
@@ -328,18 +327,24 @@ def main():
                     WHERE id = ?
                 """
                 params = [
-                    summary_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
+                    db_summary_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
                     flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'],
                     flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'],
                     flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # 💡 로그 출력 개선: DB에 저장되는 description(소개글) 원문 미리보기 추가
-                log_desc_preview = summary_text[:120].replace('\n', ' ') + "..." if len(summary_text) > 120 else summary_text.replace('\n', ' ')
+                # 💡 3단계 텍스트 추출 검증 로그 시각화
+                print("\n    ===================== 📝 3단계 텍스트 비교 로그 =====================")
+                print(f"    1️⃣ [처음 가져온 Raw 텍스트 ({len(raw_text)}자)]")
+                print(f"       👉 \"{raw_text[:200]}...\"")
+                print(f"    2️⃣ [UI 노이즈 제거 후 전체 텍스트 ({len(cleaned_text)}자)]")
+                print(f"       👉 \"{cleaned_text[:200]}...\"")
+                print(f"    3️⃣ [DB에 최종 저장된 500자 (description)]")
+                print(f"       👉 \"{db_summary_text}\"")
+                print("    ======================================================================\n")
                 
                 print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
-                print(f"        - 📄 저장된 텍스트 요약 (description): \"{log_desc_preview}\"")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
                 if flags['business_hours']:
                     formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
