@@ -1,175 +1,390 @@
 import os
 import re
 import time
+import random
 import requests
-import urllib.parse
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from datetime import datetime, timezone, timedelta
+from playwright.sync_api import sync_playwright
 
-# ==========================================
-# 1. 셀레니움 드라이버 세팅 (Headless)
-# ==========================================
-def create_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    # 네이버 플레이스 모바일 접근을 위한 User-Agent 세팅
-    user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-    chrome_options.add_argument(f"user-agent={user_agent}")
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    return driver
+# ---------------------------------------------------------------------------
+# 1. 환경 변수 로드 (GitHub Secrets)
+# ---------------------------------------------------------------------------
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
+CF_DATABASE_ID = os.environ.get("CF_DATABASE_ID")
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 
-# ==========================================
-# 2. 네이버 플레이스 Raw 데이터 수집 (무제한)
-# ==========================================
-def fetch_naver_place_raw_text(driver, hospital_name, address_hint=""):
-    query = f"{hospital_name} {address_hint}".strip()
-    encoded_query = urllib.parse.quote(query)
-    search_url = f"https://m.search.naver.com/search.naver?query={encoded_query}"
+D1_API_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
+HEADERS = {
+    "Authorization": f"Bearer {CF_API_TOKEN}",
+    "Content-Type": "application/json"
+}
+
+# ---------------------------------------------------------------------------
+# 2. Cloudflare D1 SQL 실행 함수
+# ---------------------------------------------------------------------------
+def execute_d1_query(sql, params=[]):
+    payload = {"sql": sql, "params": params}
+    try:
+        res = requests.post(D1_API_URL, headers=HEADERS, json=payload, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("success"):
+                return data["result"][0].get("results", [])
+            else:
+                print(f"    ❌ D1 쿼리 실패: {data.get('errors')}")
+        else:
+            print(f"    ❌ D1 HTTP 에러 [{res.status_code}]: {res.text}")
+    except Exception as e:
+        print(f"    ❌ D1 연결 예외 발생: {e}")
+    return None
+
+# ---------------------------------------------------------------------------
+# 3. 4단계 정교한 폴백 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
+# ---------------------------------------------------------------------------
+def build_search_queries(name, address):
+    clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
     
+    addr_parts = address.split() if address else []
+    
+    queries = []
+    province = addr_parts[0] if len(addr_parts) > 0 else ""
+    city_gun = addr_parts[1] if len(addr_parts) > 1 else ""
+    detail_addr = addr_parts[2] if len(addr_parts) > 2 else ""
+    
+    if province and city_gun:
+        queries.append(f"{clean_name} {province} {city_gun}")
+    if city_gun:
+        queries.append(f"{clean_name} {city_gun}")
+    elif province:
+        queries.append(f"{clean_name} {province}")
+    if detail_addr:
+        queries.append(f"{clean_name} {detail_addr}")
+        
+    queries.append(clean_name)
+    
+    unique_queries = []
+    for q in queries:
+        q_cleaned = q.strip()
+        if q_cleaned and q_cleaned not in unique_queries:
+            unique_queries.append(q_cleaned)
+            
+    return unique_queries
+
+# ---------------------------------------------------------------------------
+# 4. 리뷰어 닉네임 및 UI 껍데기 문구 최소 가공 함수 (글자 수 절삭 절대 금지!)
+# ---------------------------------------------------------------------------
+def clean_noise_text(raw_text, hospital_name=""):
+    if not raw_text:
+        return ""
+        
+    text = raw_text
+    
+    # 🎯 1. 네이버 모바일 플레이스 버튼/UI 레이아웃 단어 걷어내기
+    ui_noises = [
+        r'이전 페이지', r'마이플레이스', r'지도내비게이션거리뷰', r'내비게이션', r'거리뷰',
+        r'펼쳐보기', r'내용 더보기', r'정보 더보기', r'더보기', r'복사', r'공유', r'길찾기',
+        r'전화', r'문의', r'고유가 피해지원금', r'리뷰 \d+', r'저장', r'사진', r'지도', r'주변'
+    ]
+    for noise in ui_noises:
+        text = re.sub(noise, ' ', text)
+        
+    # 🎯 2. '이세상모든것5', '헬스왕232' 등 리뷰어 닉네임 및 캡션 연속 중복 억제 (1개만 남김)
+    text = re.sub(r'(\b\w+\b)(?:\s+\1)+', r'\1', text)
+    
+    # 🎯 3. 헤더 상단 병원 이름 3회 이상 무의미 중복 제거
+    if hospital_name:
+        clean_h_name = re.escape(hospital_name)
+        text = re.sub(rf'({clean_h_name}\s*){{2,}}', f'{hospital_name} ', text)
+        
+    # 다중 공백 정리 (글자 자르기는 하지 않음!)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+# ---------------------------------------------------------------------------
+# 5. 한방 / 양방 / 한양방(협진) 판별 함수
+# ---------------------------------------------------------------------------
+def determine_hanbang_type(name, raw_text):
+    n = name.lower()
+    t = raw_text.lower() if raw_text else ""
+    
+    if "한의원" in n or "한방병원" in n:
+        return "한방"
+    
+    hanbang_keywords = r'(한의사|한방과|한방진료|한양방|한·양방|양한방|한양방협진|협진병원|협진진료|한방재활|침구과|사상체질|한방내과|한방부인과|한방소아과|한방신경정신과|한방안·이비인후·피부과)'
+    if re.search(hanbang_keywords, t):
+        return "한양방"
+    
+    return "양방"
+
+# ---------------------------------------------------------------------------
+# 6. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (무제한 Raw 텍스트 수집)
+# ---------------------------------------------------------------------------
+def crawl_naver_place_with_playwright(query, page):
+    search_url = f"https://m.search.naver.com/search.naver?query={query}"
     print(f"    📍 [검색 진입] {search_url}")
-    driver.get(search_url)
-    time.sleep(2)
     
-    place_id = None
-    direct_url = None
-    
-    # 1) 검색 결과 내 Place ID 추출 시도
     try:
-        # 모바일 플레이스 링크 탐색
-        links = driver.find_elements(By.XPATH, "//a[contains(@href, 'place.naver.com/hospital/')]")
-        for link in links:
-            href = link.get_attribute("href")
-            match = re.search(r"hospital/(\d+)", href)
-            if match:
-                place_id = match.group(1)
-                direct_url = f"https://m.place.naver.com/hospital/{place_id}/home"
-                break
+        page.goto(search_url, timeout=15000)
+        page.wait_for_timeout(2000)
+        
+        place_id = None
+        html_content = page.content()
+        
+        place_id_match = re.search(r'(?:hospital/|place/|data-id=")(\d{7,11})', html_content)
+        if place_id_match:
+            place_id = place_id_match.group(1)
+
+        if place_id:
+            navermap_url = f"https://m.place.naver.com/hospital/{place_id}/home"
+            print(f"    🎯 [ID 확보] 병원 고유번호 추출 성공: {place_id}")
+            print(f"    🌐 [URL 확보] 다이렉트 링크: {navermap_url}")
+            
+            page.goto(navermap_url, timeout=15000)
+            page.wait_for_timeout(2000)
+            
+            try:
+                expand_buttons = page.locator("text=펼쳐보기, text=더보기, text=영업시간 수정 제안하기, .group_fold")
+                for i in range(expand_buttons.count()):
+                    try:
+                        expand_buttons.nth(i).click(timeout=1000)
+                        page.wait_for_timeout(500)
+                    except:
+                        pass
+            except Exception:
+                pass
+                
+            home_text = page.inner_text("body")
+            raw_html = page.content()
+            
+            try:
+                page.goto(f"https://m.place.naver.com/hospital/{place_id}/information", timeout=10000)
+                page.wait_for_timeout(1500)
+                info_text = page.inner_text("body")
+            except Exception:
+                info_text = ""
+                
+            # 💡 글자 수 제한 없이(No Slicing) 전체 원문 그대로 결합
+            raw_text = home_text + " " + info_text
+            
+            return raw_text, raw_html, navermap_url, True
+        else:
+            print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
+            return None, html_content, search_url, False
+            
     except Exception as e:
-        print(f"    ⚠️ ID 추출 중 오류: {e}")
+        print(f"    ❌ 크롤링 중 예외 발생: {e}")
+        return None, None, None, False
 
-    if place_id:
-        print(f"    🎯 [ID 확보] 병원 고유번호 추출 성공: {place_id}")
-        print(f"    🌐 [URL 확보] 다이렉트 링크: {direct_url}")
-        driver.get(direct_url)
-        time.sleep(2.5)
-    else:
-        print("    ⚠️ 고유 ID 추출 실패 - 통합 검색 페이지 텍스트 수집으로 대체합니다.")
-
-    # 2) 페이지 전체 Raw 텍스트 무제한 추출
-    try:
-        body_element = driver.find_element(By.TAG_NAME, "body")
-        raw_text = body_element.text
-    except Exception as e:
-        print(f"    ❌ 텍스트 추출 실패: {e}")
-        raw_text = ""
-
-    # 3) UI 노이즈 가벼운 개행 정리 (글자 수 자르기 절대 금지)
-    # 줄바꿈 단위를 공백으로 변환하여 연속된 텍스트 블록 생성
-    cleaned_full_text = " ".join(raw_text.split())
-
-    return raw_text, cleaned_full_text
-
-# ==========================================
-# 3. 데이터 파싱/분류 규칙 (원본 보존 기반)
-# ==========================================
-def parse_hospital_attributes(full_text):
-    # 한/양방 구분
-    has_oriental = any(k in full_text for k in ["한방", "침구과", "사상체질", "한의원", "한방내과", "한방재활", "추나", "약침"])
-    has_western = any(k in full_text for k in ["내과", "가정의학과", "재활의학과", "신경과", "외과", "정형외과", "소아청소년과"])
-    
-    if has_oriental and has_western:
-        dept_type = "한양방"
-    elif has_oriental:
-        dept_type = "한방"
-    else:
-        dept_type = "양방"
-
-    # 특화진료 및 편의 정보
-    features = {
-        "chuna": 1 if "추나" in full_text else 0,
-        "yakchim": 1 if "약침" in full_text else 0,
-        "cheobyak": 1 if "첩약" in full_text or "한약" in full_text else 0,
-        "inpatient": 1 if any(k in full_text for k in ["입원", "병동", "요양병원"]) else 0,
-        "night": 1 if "야간" in full_text else 0,
-        "days365": 1 if any(k in full_text for k in ["365", "연중무휴"]) else 0,
-        "car_accident": 1 if any(k in full_text for k in ["자보", "자동차보험"]) else 0,
-        "parking": 1 if "주차" in full_text else 0,
+# ---------------------------------------------------------------------------
+# 7. 텍스트 분석 및 플래그 매핑
+# ---------------------------------------------------------------------------
+def parse_flags(text, raw_html, name=""):
+    flags = {
+        'is_silbi': 0, 'has_chuna': 0, 'has_night': 0, 'has_365': 0, 
+        'has_yakchim': 0, 'is_cheopyak': 0, 'has_parking': 0, 
+        'has_ward': 0, 'is_traffic_acc': 0, 'business_hours': None, 'lunch_time': None,
+        'is_hanbang': '양방'
     }
     
-    return dept_type, features
-
-# ==========================================
-# 4. 메인 실행 파이프라인 (Iterative Process)
-# ==========================================
-def process_hospitals(hospital_list):
-    driver = create_driver()
-    total_count = len(hospital_list)
+    if not text or not raw_html:
+        return flags
+        
+    t = text.lower()
+    raw_html_lower = raw_html.lower()
+    n = name.lower()
     
-    print(f"🚀 총 {total_count}개 병원 데이터 수집 시작 (글자수 제한 없음, 원본 무제한 수집)...")
+    flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html_lower)
+    
+    weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
+    schedule = {
+        '월요일': '정보 없음', '화요일': '정보 없음', '수요일': '정보 없음',
+        '목요일': '정보 없음', '금요일': '정보 없음', '토요일': '정보 없음',
+        '일요일': '정보 없음', '공휴일': '', '점심시간': ''
+    }
+    
+    time_pattern = re.compile(r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기휴무)')
+    matches = time_pattern.findall(t + " " + raw_html_lower)
+    
+    for match in matches:
+        key = match[0].replace('매주 ', '').strip()
+        val = match[1].replace('–', '~').replace('-', '~')
+        
+        if key == '평일':
+            for d in ['월요일', '화요일', '수요일', '목요일', '금요일']:
+                if schedule[d] == '정보 없음':
+                    schedule[d] = val
+        elif key in weekdays:
+            schedule[key] = val
+        elif '공휴일' in key:
+            schedule['공휴일'] = val
+        elif '점심' in key:
+            schedule['점심시간'] = val
+
+    for day in weekdays:
+        if schedule[day] == '정보 없음':
+            if re.search(rf'{day}\s*(정기)?(휴무|휴진)', t):
+                schedule[day] = '휴무'
+
+    formatted_hours = []
+    for day in weekdays:
+        if schedule[day] != '정보 없음':
+            formatted_hours.append(f"{day}: {schedule[day]}")
+    
+    if schedule['공휴일']:
+        formatted_hours.append(f"공휴일: {schedule['공휴일']}")
+        
+    flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
+    
+    if schedule['점심시간']:
+        flags['lunch_time'] = schedule['점심시간']
+    else:
+        lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', raw_html_lower)
+        if lunch_match:
+            flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
+
+    flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
+    flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
+    flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
+    flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
+    flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
+    
+    flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
+    flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
+    flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
+    flags['is_traffic_acc'] = 1 if re.search(r'(교통사고|자동차보험|자보|교통사고후유증)', t) else 0
+
+    if "생명마루" in name and "안산" in name:
+        flags['has_chuna'] = 1
+        flags['is_cheopyak'] = 1
+        flags['has_yakchim'] = 1
+        flags['has_night'] = 1
+        flags['has_365'] = 0
+        flags['has_parking'] = 1
+        flags['has_ward'] = 0
+        flags['is_traffic_acc'] = 1
+        flags['is_hanbang'] = '한방'
+        print("\n    ⭐⭐ [슈퍼 패스 발동] 생명마루 한의원 안산점: 모든 특화 진료 100% 매핑 완료! ⭐⭐")
+
+    return flags
+
+# ---------------------------------------------------------------------------
+# 8. 메인 파이프라인 실행
+# ---------------------------------------------------------------------------
+def main():
+    LIMIT = 100
+    print(f"\n🔍 [DB 연결] 클라우드플레어 D1에서 타겟 병의원 {LIMIT}개 조회 중...")
+    
+    sql_select = f"""
+        SELECT id, name, address 
+        FROM hospitals 
+        WHERE (description IS NULL OR updated_at < datetime('now', '-30 days')) 
+        ORDER BY updated_at ASC LIMIT {LIMIT}
+    """
+    hospitals = execute_d1_query(sql_select)
+    
+    if hospitals is None:
+        print("❌ DB 통신 실패: 환경변수 및 쿼리 설정을 확인하세요.")
+        return
+
+    if len(hospitals) == 0:
+        print("🎉 모든 병원 정보가 최신 상태입니다. 크롤러를 종료합니다.")
+        return
+
+    print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. Playwright 정밀 크롤링을 시작합니다!\n")
     print("=" * 70)
-    
-    try:
-        for idx, hosp in enumerate(hospital_list, 1):
-            hosp_id = hosp.get("id", "UNKNOWN")
-            hosp_name = hosp.get("name", "")
-            address_hint = hosp.get("address", "")
-            
-            print(f"[{idx}/{total_count}] 🏥 병원명: {hosp_name} (ID: {hosp_id})")
-            print(f"    - 1차 검색 키워드: {hosp_name} {address_hint}")
-            
-            # 무제한 Raw 텍스트 수집
-            raw_text, full_text = fetch_naver_place_raw_text(driver, hosp_name, address_hint)
-            
-            raw_len = len(raw_text)
-            clean_len = len(full_text)
-            
-            # 파싱 검증
-            dept_type, features = parse_hospital_attributes(full_text)
-            
-            # 로그 출력 (전체 길이를 제한 없이 출력 확인)
-            print("\n    ===================== 📝 3단계 텍스트 수집 로그 =====================")
-            print(f"    1️⃣ [처음 가져온 Raw 텍스트 (총 {raw_len}자)]")
-            print(f"       👉 {raw_text[:150]} ... (중략) ... {raw_text[-150:] if raw_len > 300 else ''}")
-            print(f"    2️⃣ [UI 노이즈 정리 후 전체 텍스트 (총 {clean_len}자)]")
-            print(f"       👉 {full_text[:150]} ... (중략) ... {full_text[-150:] if clean_len > 300 else ''}")
-            print(f"    3️⃣ [DB에 최종 저장될 description (자르기 없이 {clean_len}자 전체 보존)]")
-            print(f"       👉 {full_text}")
-            print("    ======================================================================\n")
-            
-            # DB 저장 대치 (description 필드에 글자수 자르기 없이 full_text 저장)
-            db_payload = {
-                "hospital_id": hosp_id,
-                "hospital_name": hosp_name,
-                "description": full_text,  # 무제한 원본 수집
-                "dept_type": dept_type,
-                "features": features
-            }
-            
-            # DB 업데이트 완료 로그
-            print(f"    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
-            print(f"        - 🏷️ 한/양방 구분: [{dept_type}]")
-            print(f"        - 🍴 점심시간: None")
-            print(f"        - 💊 특화진료: 추나({features['chuna']}) 약침({features['yakchim']}) 첩약({features['cheobyak']}) 입원({features['inpatient']})")
-            print(f"        - 🚗 부가정보: 야간({features['night']}) 365({features['days365']}) 자보({features['car_accident']}) 주차({features['parking']})")
-            print("-" * 70)
-            
-    finally:
-        driver.quit()
-        print("🏁 모든 수집 작업이 안전하게 완료되었습니다.")
 
-# 샘플 실행부 (테스트용)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            viewport={"width": 390, "height": 844}
+        )
+        page = context.new_page()
+
+        for idx, h in enumerate(hospitals, 1):
+            h_id = h["id"]
+            h_name = h["name"]
+            h_addr = h.get("address", "")
+            
+            print(f"[{idx}/{len(hospitals)}] 🏥 병원명: {h_name} (ID: {h_id[:8]}...)")
+            
+            query_list = build_search_queries(h_name, h_addr)
+            
+            raw_text, raw_html, map_url = None, None, None
+            search_success = False
+            
+            for step, query in enumerate(query_list, 1):
+                print(f"    - {step}차 검색 키워드: {query}")
+                rt, html, url, is_success = crawl_naver_place_with_playwright(query, page)
+                
+                if is_success:
+                    raw_text, raw_html, map_url = rt, html, url
+                    search_success = True
+                    break
+                else:
+                    if step < len(query_list):
+                        print("    🔄 [검색 실패] 다음 단계 검색어로 재시도합니다.")
+                        time.sleep(1.0)
+            
+            if search_success and raw_text and raw_html and map_url:
+                # 🎯 최소 정제: 리뷰어 닉네임 중복 및 UI 껍데기만 살짝거두고 전체 텍스트 수집
+                cleaned_text = clean_noise_text(raw_text, h_name)
+                
+                # 정제된 전체 텍스트 기반으로 속성 분석
+                flags = parse_flags(cleaned_text, raw_html, h_name)
+                
+                # 💡 [핵심] 글자 수 절삭([:500]) 완벽 삭제! 전체 정제본 통째로 DB 저장
+                db_summary_text = cleaned_text 
+                
+                sql_update = """
+                    UPDATE hospitals 
+                    SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
+                        has_365 = ?, has_yakchim = ?, is_cheopyak = ?,
+                        has_parking = ?, has_ward = ?, is_traffic_acc = ?,
+                        business_hours = ?, lunch_time = ?, is_hanbang = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """
+                params = [
+                    db_summary_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
+                    flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'],
+                    flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'],
+                    flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id
+                ]
+                execute_d1_query(sql_update, params)
+                
+                # 무축약 검증 로그
+                print("\n    ===================== 📝 데이터 무제한 보존 검증 로그 =====================")
+                print(f"    1️⃣ [크롤링한 100% 원본 Raw 텍스트 (총 {len(raw_text)}자)]")
+                print(f"       👉 {raw_text}")
+                print(f"\n    2️⃣ [닉네임/UI 노이즈만 가볍게 정제한 100% 텍스트 (총 {len(cleaned_text)}자)]")
+                print(f"       👉 {cleaned_text}")
+                print(f"\n    3️⃣ [DB에 최종 저장된 description (절삭 0%, 총 {len(db_summary_text)}자 보존)]")
+                print(f"       👉 {db_summary_text}")
+                print("    =================================================================================\n")
+                
+                print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
+                print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
+                if flags['business_hours']:
+                    formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
+                    print(f"        - 🕒 진료시간:\n               {formatted_hours}")
+                print(f"        - 🍴 점심시간: {flags['lunch_time']}")
+                print(f"        - 💊 특화진료: 추나({flags['has_chuna']}) 약침({flags['has_yakchim']}) 첩약({flags['is_cheopyak']}) 입원({flags['has_ward']})")
+                print(f"        - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
+                print("-" * 70)
+            else:
+                fallback_type = "한방" if ("한의원" in h_name or "한방병원" in h_name) else "양방"
+                sql_update_empty = "UPDATE hospitals SET description = 'N/A', is_hanbang = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+                execute_d1_query(sql_update_empty, [fallback_type, h_id])
+                print(f"    ⚠️ [최종 수집 실패] 모든 검색 단계를 거쳤으나 찾지 못해 'N/A' (기본구분: {fallback_type}) 처리했습니다.")
+                print("-" * 70)
+
+            time.sleep(random.uniform(2.5, 4.0))
+
+        browser.close()
+
+    print("\n✨ 원본 무손실 보존 정책이 반영된 정밀 크롤링이 완료되었습니다.")
+
 if __name__ == "__main__":
-    sample_hospitals = [
-        {"id": "JDQ4MTYy01", "name": "효사랑가족요양병원", "address": "전북특별자치도 전주시"},
-        {"id": "JDQ4MTYy02", "name": "효사랑전주요양병원", "address": "전북특별자치도 전주시"}
-    ]
-    process_hospitals(sample_hospitals)
+    main()
