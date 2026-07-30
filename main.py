@@ -72,7 +72,36 @@ def build_search_queries(name, address):
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 한방 / 양방 / 한양방(협진) 판별 함수 (Raw 텍스트 기반)
+# 4. UI 껍데기 및 리뷰어 ID 1차 정제 함수 (글자 수 절삭 0%)
+# ---------------------------------------------------------------------------
+def clean_noise_text(raw_text, hospital_name=""):
+    if not raw_text:
+        return ""
+        
+    text = raw_text
+    
+    # UI 버튼 문구 걷어내기
+    ui_noises = [
+        r'이전 페이지', r'마이플레이스', r'지도내비게이션거리뷰', r'내비게이션', r'거리뷰',
+        r'펼쳐보기', r'내용 더보기', r'정보 더보기', r'더보기', r'복사', r'공유', r'길찾기',
+        r'전화', r'문의', r'고유가 피해지원금', r'리뷰 \d+', r'저장', r'사진', r'지도', r'주변'
+    ]
+    for noise in ui_noises:
+        text = re.sub(noise, ' ', text)
+        
+    # 리뷰어 닉네임 연속 반복 정제 (1개만 남김)
+    text = re.sub(r'(\b\w+\b)(?:\s+\1)+', r'\1', text)
+    
+    # 헤더 상단 병원 이름 중복 정제
+    if hospital_name:
+        clean_h_name = re.escape(hospital_name)
+        text = re.sub(rf'({clean_h_name}\s*){{2,}}', f'{hospital_name} ', text)
+        
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+# ---------------------------------------------------------------------------
+# 5. 한방 / 양방 / 한양방(협진) 판별 함수
 # ---------------------------------------------------------------------------
 def determine_hanbang_type(name, raw_text):
     n = name.lower()
@@ -88,7 +117,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 5. Playwright를 이용한 네이버 플레이스 정밀 크롤링 (순수 Raw 텍스트 수집)
+# 6. Playwright를 이용한 네이버 플레이스 크롤링
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -134,10 +163,8 @@ def crawl_naver_place_with_playwright(query, page):
             except Exception:
                 info_text = ""
                 
-            # 💡 [PURE RAW] 가공/절삭/정제 0% - 화면 전체 텍스트 결합
-            pure_raw_text = home_text + "\n" + info_text
-            
-            return pure_raw_text, raw_html, navermap_url, True
+            raw_text = home_text + "\n" + info_text
+            return raw_text, raw_html, navermap_url, True
         else:
             print("    ⚠️ 병원 고유 ID를 찾을 수 없습니다.")
             return None, html_content, search_url, False
@@ -147,7 +174,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 6. 텍스트 분석 및 플래그 매핑
+# 7. 텍스트 분석 및 플래그 매핑
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -239,7 +266,7 @@ def parse_flags(text, raw_html, name=""):
     return flags
 
 # ---------------------------------------------------------------------------
-# 7. 메인 파이프라인 실행
+# 8. 메인 파이프라인 실행
 # ---------------------------------------------------------------------------
 def main():
     LIMIT = 100
@@ -281,7 +308,7 @@ def main():
             
             query_list = build_search_queries(h_name, h_addr)
             
-            pure_raw_text, raw_html, map_url = None, None, None
+            raw_text, raw_html, map_url = None, None, None
             search_success = False
             
             for step, query in enumerate(query_list, 1):
@@ -289,7 +316,7 @@ def main():
                 rt, html, url, is_success = crawl_naver_place_with_playwright(query, page)
                 
                 if is_success:
-                    pure_raw_text, raw_html, map_url = rt, html, url
+                    raw_text, raw_html, map_url = rt, html, url
                     search_success = True
                     break
                 else:
@@ -297,11 +324,20 @@ def main():
                         print("    🔄 [검색 실패] 다음 단계 검색어로 재시도합니다.")
                         time.sleep(1.0)
             
-            if search_success and pure_raw_text and raw_html and map_url:
-                # Raw 텍스트 그대로 속성 분석 진행
-                flags = parse_flags(pure_raw_text, raw_html, h_name)
+            if search_success and raw_text and raw_html and map_url:
+                # 1단계: 순수 Raw 텍스트 (화면에서 가져온 원본 100%)
+                step1_raw_text = raw_text
                 
-                # 💡 [100% PURE RAW] 어떠한 필터링/가공/절삭 없이 그대로 DB 저장
+                # 2단계: 1차 가공 (노이즈 및 중복 단어 정제 100%)
+                step2_cleaned_text = clean_noise_text(step1_raw_text, h_name)
+                
+                # 3단계: DB에 최종 저장되는 텍스트 (무절삭)
+                step3_db_text = step2_cleaned_text
+                
+                # 정제된 텍스트 기반으로 플래그 추출
+                flags = parse_flags(step2_cleaned_text, raw_html, h_name)
+                
+                # DB 업데이트
                 sql_update = """
                     UPDATE hospitals 
                     SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
@@ -311,20 +347,24 @@ def main():
                     WHERE id = ?
                 """
                 params = [
-                    pure_raw_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
+                    step3_db_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
                     flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'],
                     flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'],
                     flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # Pure Raw 텍스트 무축약 출력
-                print("\n    ===================== 📝 Pure Raw 텍스트 검증 로그 =====================")
-                print(f"    📄 [화면에서 추출된 무가공 Raw 텍스트 100% (총 {len(pure_raw_text)}자)]")
-                print(f"    👉 {pure_raw_text}")
-                print("    ========================================================================\n")
+                # 💡 [원장님 요청 100% 반영] 3단계 무축약 전 과정 비교 출력 로그
+                print("\n    ===================== 📝 3단계 텍스트 처리 비교 로그 (전체 출력) =====================")
+                print(f"    1️⃣ [1단계: 화면에서 추출한 순수 Raw 텍스트 원본 (총 {len(step1_raw_text)}자)]")
+                print(f"       👉 {step1_raw_text}")
+                print(f"\n    2️⃣ [2단계: 노이즈/중복 정제 후 텍스트 (총 {len(step2_cleaned_text)}자)]")
+                print(f"       👉 {step2_cleaned_text}")
+                print(f"\n    3️⃣ [3단계: DB에 최종 저장된 description (절삭 0%, 총 {len(step3_db_text)}자)]")
+                print(f"       👉 {step3_db_text}")
+                print("    ======================================================================================\n")
                 
-                print("    ✅ [저장 성공] DB에 Pure Raw Data 업데이트가 완료되었습니다.")
+                print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
                 if flags['business_hours']:
                     formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
@@ -344,7 +384,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ 화면 노출 원문 100% 그대로 수집이 완료되었습니다.")
+    print("\n✨ 3단계 전체 대조 로그 출력이 반영된 정밀 크롤링이 마무리되었습니다.")
 
 if __name__ == "__main__":
     main()
