@@ -72,31 +72,40 @@ def build_search_queries(name, address):
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. UI 껍데기 및 리뷰어 ID 1차 정제 함수 (글자 수 절삭 0%)
+# 4. 원장님 정교화 패턴 적용: 시작/끝 Anchor 기반 텍스트 정제 함수
 # ---------------------------------------------------------------------------
-def clean_noise_text(raw_text, hospital_name=""):
+def clean_noise_text_with_anchors(raw_text):
     if not raw_text:
         return ""
         
     text = raw_text
     
-    # UI 버튼 문구 걷어내기
-    ui_noises = [
-        r'이전 페이지', r'마이플레이스', r'지도내비게이션거리뷰', r'내비게이션', r'거리뷰',
-        r'펼쳐보기', r'내용 더보기', r'정보 더보기', r'더보기', r'복사', r'공유', r'길찾기',
-        r'전화', r'문의', r'고유가 피해지원금', r'리뷰 \d+', r'저장', r'사진', r'지도', r'주변'
-    ]
-    for noise in ui_noises:
-        text = re.sub(noise, ' ', text)
+    # 🎯 [시작 Anchor] "리뷰 [숫자]" 패턴 찾기 (예: 소아청소년과리뷰 92, 정신건강의학과리뷰 114)
+    # 리뷰 숫자 바로 뒤부터 텍스트를 수집하여 앞단의 모든 UI 껍데기 제거
+    review_match = re.search(r'리뷰\s*\d+', text)
+    if review_match:
+        text = text[review_match.end():]
         
-    # 리뷰어 닉네임 연속 반복 정제 (1개만 남김)
-    text = re.sub(r'(\b\w+\b)(?:\s+\1)+', r'\1', text)
+    # 🎯 [끝 Anchor - 1순위] "위 진료정보의 저작권은 건강보험심사평가원..." 문구 전까지 절삭
+    simpyung_index = text.find("위 진료정보의 저작권은 건강보험심사평가원")
+    if simpyung_index != -1:
+        text = text[:simpyung_index]
+    else:
+        # 🎯 [끝 Anchor - 2순위] "알고 계신 정보와 다른 정보가 있나요?" 전까지 절삭
+        info_suggest_index = text.find("알고 계신 정보와 다른 정보가 있나요?")
+        if info_suggest_index != -1:
+            text = text[:info_suggest_index]
+        else:
+            # 🎯 [끝 Anchor - 3순위] "로딩중" 전까지 절삭
+            loading_index = text.find("로딩중")
+            if loading_index != -1:
+                text = text[:loading_index]
+                
+    # 🎯 캡차/영문 약관 등 네이버 공통 보안 푸터 문구 완전 삭제
+    text = re.sub(r'Please complete the security verification.*', '', text, flags=re.DOTALL)
+    text = re.sub(r'Copyright © NAVER Corp.*', '', text, flags=re.DOTALL)
     
-    # 헤더 상단 병원 이름 중복 정제
-    if hospital_name:
-        clean_h_name = re.escape(hospital_name)
-        text = re.sub(rf'({clean_h_name}\s*){{2,}}', f'{hospital_name} ', text)
-        
+    # 잡다한 연속 공백 정리
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -117,7 +126,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 6. Playwright를 이용한 네이버 플레이스 크롤링
+# 6. Playwright를 이용한 크롤링 ('펼쳐보기' 강제 클릭 보강)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -142,12 +151,22 @@ def crawl_naver_place_with_playwright(query, page):
             page.goto(navermap_url, timeout=15000)
             page.wait_for_timeout(2000)
             
+            # 💡 [보강된 펼쳐보기 강제 클릭] 진료시간/영업시간 전체를 펼치기 위한 다중 클릭 시도
             try:
-                expand_buttons = page.locator("text=펼쳐보기, text=더보기, text=영업시간 수정 제안하기, .group_fold")
-                for i in range(expand_buttons.count()):
+                click_targets = [
+                    "text=펼쳐보기", 
+                    "text=영업시간", 
+                    "text=진료 시작", 
+                    "text=진료 종료", 
+                    ".g2u4Z", # 네이버 모바일 플레이스 영업시간 클래스
+                    ".group_fold"
+                ]
+                for target in click_targets:
                     try:
-                        expand_buttons.nth(i).click(timeout=1000)
-                        page.wait_for_timeout(500)
+                        elem = page.locator(target).first
+                        if elem.is_visible():
+                            elem.click(timeout=1000)
+                            page.wait_for_timeout(500)
                     except:
                         pass
             except Exception:
@@ -325,19 +344,19 @@ def main():
                         time.sleep(1.0)
             
             if search_success and raw_text and raw_html and map_url:
-                # 1단계: 순수 Raw 텍스트 (화면에서 가져온 원본 100%)
+                # 1단계: 화면에서 긁어온 100% Raw 텍스트
                 step1_raw_text = raw_text
                 
-                # 2단계: 1차 가공 (노이즈 및 중복 단어 정제 100%)
-                step2_cleaned_text = clean_noise_text(step1_raw_text, h_name)
+                # 2단계: 원장님 정제 규칙 적용 (Anchor 기반 시작/끝 정제)
+                step2_cleaned_text = clean_noise_text_with_anchors(step1_raw_text)
                 
-                # 3단계: DB에 최종 저장되는 텍스트 (무절삭)
+                # 3단계: DB 저장용 텍스트 (절삭률 0%)
                 step3_db_text = step2_cleaned_text
                 
-                # 정제된 텍스트 기반으로 플래그 추출
+                # 속성 파싱
                 flags = parse_flags(step2_cleaned_text, raw_html, h_name)
                 
-                # DB 업데이트
+                # DB 저장
                 sql_update = """
                     UPDATE hospitals 
                     SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
@@ -354,17 +373,17 @@ def main():
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # 💡 [원장님 요청 100% 반영] 3단계 무축약 전 과정 비교 출력 로그
-                print("\n    ===================== 📝 3단계 텍스트 처리 비교 로그 (전체 출력) =====================")
-                print(f"    1️⃣ [1단계: 화면에서 추출한 순수 Raw 텍스트 원본 (총 {len(step1_raw_text)}자)]")
+                # 3단계 대조 출력 로그
+                print("\n    ===================== 📝 3단계 Anchor 정제 비교 로그 (전체 출력) =====================")
+                print(f"    1️⃣ [1단계: 화면 추출 순수 Raw 텍스트 (총 {len(step1_raw_text)}자)]")
                 print(f"       👉 {step1_raw_text}")
-                print(f"\n    2️⃣ [2단계: 노이즈/중복 정제 후 텍스트 (총 {len(step2_cleaned_text)}자)]")
+                print(f"\n    2️⃣ [2단계: Anchor 정제 후 알짜배기 텍스트 (총 {len(step2_cleaned_text)}자)]")
                 print(f"       👉 {step2_cleaned_text}")
-                print(f"\n    3️⃣ [3단계: DB에 최종 저장된 description (절삭 0%, 총 {len(step3_db_text)}자)]")
+                print(f"\n    3️⃣ [3단계: DB에 최종 저장된 description (총 {len(step3_db_text)}자)]")
                 print(f"       👉 {step3_db_text}")
                 print("    ======================================================================================\n")
                 
-                print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
+                print("    ✅ [저장 성공] Anchor 정제본이 DB에 업데이트되었습니다.")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
                 if flags['business_hours']:
                     formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
@@ -384,7 +403,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ 3단계 전체 대조 로그 출력이 반영된 정밀 크롤링이 마무리되었습니다.")
+    print("\n✨ Anchor 정제 규칙 및 펼쳐보기 강제 클릭이 포함된 크롤링이 마무리되었습니다.")
 
 if __name__ == "__main__":
     main()
