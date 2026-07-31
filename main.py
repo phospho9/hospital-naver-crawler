@@ -39,7 +39,7 @@ def execute_d1_query(sql, params=[]):
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 4단계 검색 키워드 생성 함수
+# 3. 4단계 검색 키워드 생성 함수 (법인/재단명 완벽 제거)
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
@@ -72,7 +72,7 @@ def build_search_queries(name, address):
     return unique_queries
 
 # ---------------------------------------------------------------------------
-# 4. 원장님 정교화 패턴 적용: 시작/끝 Anchor 기반 텍스트 정제 함수
+# 4. 시작/끝 Anchor 기반 본문 정제 함수 (UI 껍데기 제거, 절삭률 0%)
 # ---------------------------------------------------------------------------
 def clean_noise_text_with_anchors(raw_text):
     if not raw_text:
@@ -81,7 +81,6 @@ def clean_noise_text_with_anchors(raw_text):
     text = raw_text
     
     # 🎯 [시작 Anchor] "리뷰 [숫자]" 패턴 찾기 (예: 소아청소년과리뷰 92, 정신건강의학과리뷰 114)
-    # 리뷰 숫자 바로 뒤부터 텍스트를 수집하여 앞단의 모든 UI 껍데기 제거
     review_match = re.search(r'리뷰\s*\d+', text)
     if review_match:
         text = text[review_match.end():]
@@ -101,11 +100,11 @@ def clean_noise_text_with_anchors(raw_text):
             if loading_index != -1:
                 text = text[:loading_index]
                 
-    # 🎯 캡차/영문 약관 등 네이버 공통 보안 푸터 문구 완전 삭제
+    # 🎯 네이버 캡차/영문 약관 등 공통 보안 문구 완전 삭제
     text = re.sub(r'Please complete the security verification.*', '', text, flags=re.DOTALL)
     text = re.sub(r'Copyright © NAVER Corp.*', '', text, flags=re.DOTALL)
     
-    # 잡다한 연속 공백 정리
+    # 연속 다중 공백 정리
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -126,7 +125,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 6. Playwright를 이용한 크롤링 ('펼쳐보기' 강제 클릭 보강)
+# 6. Playwright를 이용한 네이버 플레이스 정밀 크롤링
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
@@ -151,27 +150,6 @@ def crawl_naver_place_with_playwright(query, page):
             page.goto(navermap_url, timeout=15000)
             page.wait_for_timeout(2000)
             
-            # 💡 [보강된 펼쳐보기 강제 클릭] 진료시간/영업시간 전체를 펼치기 위한 다중 클릭 시도
-            try:
-                click_targets = [
-                    "text=펼쳐보기", 
-                    "text=영업시간", 
-                    "text=진료 시작", 
-                    "text=진료 종료", 
-                    ".g2u4Z", # 네이버 모바일 플레이스 영업시간 클래스
-                    ".group_fold"
-                ]
-                for target in click_targets:
-                    try:
-                        elem = page.locator(target).first
-                        if elem.is_visible():
-                            elem.click(timeout=1000)
-                            page.wait_for_timeout(500)
-                    except:
-                        pass
-            except Exception:
-                pass
-                
             home_text = page.inner_text("body")
             raw_html = page.content()
             
@@ -193,14 +171,13 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 7. 텍스트 분석 및 플래그 매핑
+# 7. 텍스트 분석 및 특화 플래그 매핑 (진료시간 제외)
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
         'is_silbi': 0, 'has_chuna': 0, 'has_night': 0, 'has_365': 0, 
         'has_yakchim': 0, 'is_cheopyak': 0, 'has_parking': 0, 
-        'has_ward': 0, 'is_traffic_acc': 0, 'business_hours': None, 'lunch_time': None,
-        'is_hanbang': '양방'
+        'has_ward': 0, 'is_traffic_acc': 0, 'is_hanbang': '양방'
     }
     
     if not text or not raw_html:
@@ -211,60 +188,12 @@ def parse_flags(text, raw_html, name=""):
     n = name.lower()
     
     flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html_lower)
-    
-    weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
-    schedule = {
-        '월요일': '정보 없음', '화요일': '정보 없음', '수요일': '정보 없음',
-        '목요일': '정보 없음', '금요일': '정보 없음', '토요일': '정보 없음',
-        '일요일': '정보 없음', '공휴일': '', '점심시간': ''
-    }
-    
-    time_pattern = re.compile(r'(월요일|화요일|수요일|목요일|금요일|토요일|일요일|평일|공휴일|점심)\s*[:]?\s*(\d{1,2}:\d{2}\s*[~–\-]\s*\d{1,2}:\d{2}|휴무|휴진|정기휴무)')
-    matches = time_pattern.findall(t + " " + raw_html_lower)
-    
-    for match in matches:
-        key = match[0].replace('매주 ', '').strip()
-        val = match[1].replace('–', '~').replace('-', '~')
-        
-        if key == '평일':
-            for d in ['월요일', '화요일', '수요일', '목요일', '금요일']:
-                if schedule[d] == '정보 없음':
-                    schedule[d] = val
-        elif key in weekdays:
-            schedule[key] = val
-        elif '공휴일' in key:
-            schedule['공휴일'] = val
-        elif '점심' in key:
-            schedule['점심시간'] = val
-
-    for day in weekdays:
-        if schedule[day] == '정보 없음':
-            if re.search(rf'{day}\s*(정기)?(휴무|휴진)', t):
-                schedule[day] = '휴무'
-
-    formatted_hours = []
-    for day in weekdays:
-        if schedule[day] != '정보 없음':
-            formatted_hours.append(f"{day}: {schedule[day]}")
-    
-    if schedule['공휴일']:
-        formatted_hours.append(f"공휴일: {schedule['공휴일']}")
-        
-    flags['business_hours'] = "\n".join(formatted_hours) if len(formatted_hours) > 0 else None
-    
-    if schedule['점심시간']:
-        flags['lunch_time'] = schedule['점심시간']
-    else:
-        lunch_match = re.search(r'(휴게시간|점심시간|휴게|점심|브레이크)[^\d]*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', raw_html_lower)
-        if lunch_match:
-            flags['lunch_time'] = f"{lunch_match.group(2)} ~ {lunch_match.group(3)}"
 
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
     flags['is_cheopyak'] = 1 if re.search(r'(첩약건강보험|첩약|한약|보약)', t) else 0
     flags['has_night'] = 1 if re.search(r'(야간|야간진료|20:00|21:00|밤진료)', t) else 0
-    
     flags['has_365'] = 1 if re.search(r'(365|연중무휴|매일\s*진료)', t) else 0
     flags['is_silbi'] = 1 if re.search(r'(실비|도수치료|체외충격파)', t) else 0
     flags['has_parking'] = 1 if re.search(r'(주차|무료주차|발렛|주차장)', t) else 0
@@ -344,36 +273,30 @@ def main():
                         time.sleep(1.0)
             
             if search_success and raw_text and raw_html and map_url:
-                # 1단계: 화면에서 긁어온 100% Raw 텍스트
                 step1_raw_text = raw_text
-                
-                # 2단계: 원장님 정제 규칙 적용 (Anchor 기반 시작/끝 정제)
                 step2_cleaned_text = clean_noise_text_with_anchors(step1_raw_text)
-                
-                # 3단계: DB 저장용 텍스트 (절삭률 0%)
                 step3_db_text = step2_cleaned_text
                 
-                # 속성 파싱
                 flags = parse_flags(step2_cleaned_text, raw_html, h_name)
                 
-                # DB 저장
+                # DB 업데이트 (진료시간 필드 제외, description 및 특화 플래그 업데이트)
                 sql_update = """
                     UPDATE hospitals 
                     SET description = ?, navermap_url = ?, is_silbi = ?, has_chuna = ?, has_night = ?, 
                         has_365 = ?, has_yakchim = ?, is_cheopyak = ?,
                         has_parking = ?, has_ward = ?, is_traffic_acc = ?,
-                        business_hours = ?, lunch_time = ?, is_hanbang = ?, updated_at = CURRENT_TIMESTAMP
+                        is_hanbang = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """
                 params = [
                     step3_db_text, map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'],
                     flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'],
                     flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'],
-                    flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id
+                    flags['is_hanbang'], h_id
                 ]
                 execute_d1_query(sql_update, params)
                 
-                # 3단계 대조 출력 로그
+                # 3단계 무축약 전 과정 비교 출력 로그
                 print("\n    ===================== 📝 3단계 Anchor 정제 비교 로그 (전체 출력) =====================")
                 print(f"    1️⃣ [1단계: 화면 추출 순수 Raw 텍스트 (총 {len(step1_raw_text)}자)]")
                 print(f"       👉 {step1_raw_text}")
@@ -383,12 +306,8 @@ def main():
                 print(f"       👉 {step3_db_text}")
                 print("    ======================================================================================\n")
                 
-                print("    ✅ [저장 성공] Anchor 정제본이 DB에 업데이트되었습니다.")
+                print("    ✅ [저장 성공] DB 업데이트가 완료되었습니다.")
                 print(f"        - 🏷️ 한/양방 구분: [{flags['is_hanbang']}]")
-                if flags['business_hours']:
-                    formatted_hours = "\n               ".join(flags['business_hours'].split('\n'))
-                    print(f"        - 🕒 진료시간:\n               {formatted_hours}")
-                print(f"        - 🍴 점심시간: {flags['lunch_time']}")
                 print(f"        - 💊 특화진료: 추나({flags['has_chuna']}) 약침({flags['has_yakchim']}) 첩약({flags['is_cheopyak']}) 입원({flags['has_ward']})")
                 print(f"        - 🚗 부가정보: 야간({flags['has_night']}) 365({flags['has_365']}) 자보({flags['is_traffic_acc']}) 주차({flags['has_parking']})")
                 print("-" * 70)
@@ -403,7 +322,7 @@ def main():
 
         browser.close()
 
-    print("\n✨ Anchor 정제 규칙 및 펼쳐보기 강제 클릭이 포함된 크롤링이 마무리되었습니다.")
+    print("\n✨ 안정적인 병원 정보 및 특화진료 정밀 수집이 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
