@@ -99,15 +99,16 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 6. Playwright 크롤링
+# 6. Playwright 크롤링 (💡 안티봇 우회 및 안정화 적용)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
     print(f"    📍 [검색] {query}")
     
     try:
-        page.goto(search_url, timeout=10000, wait_until="domcontentloaded")
-        page.wait_for_timeout(500) 
+        # 💡 네이버 타임아웃 방어: 기존 10000ms -> 15000ms 여유 부여
+        page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+        page.wait_for_timeout(random.randint(800, 1500)) # 💡 인간다운 랜덤 대기 (봇 탐지 회피)
         
         place_id = None
         html_content = page.content()
@@ -118,18 +119,17 @@ def crawl_naver_place_with_playwright(query, page):
 
         if place_id:
             navermap_url = f"https://m.place.naver.com/hospital/{place_id}/home"
-            page.goto(navermap_url, timeout=10000, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
+            page.goto(navermap_url, timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(random.randint(1200, 2000)) # 💡 상세페이지 렌더링을 확실하게 기다림
             
-            # 펼쳐보기 클릭 후 충분히 렌더링되도록 대기
             try:
                 click_selectors = ["text=펼쳐보기", "text=영업시간", ".g2u4Z", ".group_fold", "[aria-expanded='false']"]
                 for selector in click_selectors:
                     try:
                         elements = page.locator(selector)
                         for i in range(min(elements.count(), 2)):
-                            elements.nth(i).click(timeout=500)
-                            page.wait_for_timeout(200) # 렌더링 안정성 확보
+                            elements.nth(i).click(timeout=1000)
+                            page.wait_for_timeout(random.randint(300, 700)) # 💡 클릭 후 자연스럽게 대기
                     except:
                         pass
             except Exception:
@@ -139,8 +139,8 @@ def crawl_naver_place_with_playwright(query, page):
             raw_html = page.content()
             
             try:
-                page.goto(f"https://m.place.naver.com/hospital/{place_id}/information", timeout=10000, wait_until="domcontentloaded")
-                page.wait_for_timeout(500) 
+                page.goto(f"https://m.place.naver.com/hospital/{place_id}/information", timeout=15000, wait_until="domcontentloaded")
+                page.wait_for_timeout(random.randint(1000, 1500)) 
                 info_text = page.inner_text("body")
             except Exception:
                 info_text = ""
@@ -155,7 +155,7 @@ def crawl_naver_place_with_playwright(query, page):
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 7. 정밀 플래그 / 진료시간 / 소개글 파서 (💡 정밀 보정 완료)
+# 7. 정밀 플래그 / 진료시간 / 소개글 파서 
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -171,21 +171,17 @@ def parse_flags(text, raw_html, name=""):
     
     flags['is_hanbang'] = determine_hanbang_type(name, t + " " + raw_html.lower())
 
-    # 💡 1. 병원 소개글 정밀 정제 (네이버 시스템 문구 및 공지사항 차단)
     desc_match = re.search(r'찾아가는길\s*(.*?)(?:내용\s*더보기|영업시간|진료시간|휴무일|편의|전화번호|홈\s*리뷰|고유가|안내)', text, re.DOTALL)
     if desc_match:
         clean_desc = desc_match.group(1).strip()
-        # 노이즈 문구 추가 제거
         clean_desc = re.sub(r'(거리뷰|지도|내비게이션|홈|리뷰|사진|주변\s*정보|전화|공유|길찾기).*', '', clean_desc).strip()
         if len(clean_desc) > 3:
             flags['description'] = clean_desc
             
     if not flags['description']:
-        # 소개글이 따로 없으면 기본 정보에서 첫 문장만 발췌
         clean_text_sub = re.sub(r'^(?:진료\s*중|곧\s*휴게시간|영업\s*중|\d{1,2}:\d{2}에\s*진료\s*종료|길찾기|공유|전화|홈|리뷰|사진|지도|주변\s*정보)\s*', '', text).strip()
         flags['description'] = clean_text_sub[:120].strip() + "..." if len(clean_text_sub) > 120 else clean_text_sub.strip()
 
-    # 💡 2. 요일별 진료시간 파싱 (철저하게 요일별 매칭)
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     schedule = {day: '정보 없음' for day in weekdays}
     
@@ -201,11 +197,9 @@ def parse_flags(text, raw_html, name=""):
         if day_full in schedule and schedule[day_full] == '정보 없음': 
             schedule[day_full] = val
 
-    # 💡 3. 점심시간 파싱 (영업시간 전체와 겹치지 않도록 제한)
     lunch_match = re.search(r'(?:휴게시간|점심시간|휴게|브레이크\s*타임)\s*[:]?\s*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', text)
     if lunch_match:
         start_h, end_h = lunch_match.group(1), lunch_match.group(2)
-        # 점심시간은 대략 11시~15시 사이에 시작하므로 필터링 (09:00 시작하는 전체 영업시간 오인 방지)
         try:
             start_hour_int = int(start_h.split(':')[0])
             if 11 <= start_hour_int <= 14:
@@ -221,10 +215,8 @@ def parse_flags(text, raw_html, name=""):
     if formatted_hours:
         flags['business_hours'] = "\n".join(formatted_hours)
     else:
-        # 요일별 시간이 안 잡히고 "진료 중 13:00에..." 같은 임시 텍스트는 business_hours에 넣지 않음 (NULL 유지)
         flags['business_hours'] = None
 
-    # 💡 4. 시설 배지 파싱
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', t) else 0
     flags['has_chuna'] = 1 if re.search(r'(추나|추나요법|척추교정)', t) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉독|봉약침)', t) else 0
@@ -259,11 +251,24 @@ def main():
     print(f"🚀 총 {len(hospitals)}개의 타겟 병원을 찾았습니다. Playwright 정밀 크롤링을 시작합니다!\n")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled", # 💡 webdriver 흔적 지우기
+                "--disable-infobars"
+            ]
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            viewport={"width": 390, "height": 844}
+            viewport={"width": 390, "height": 844},
+            java_script_enabled=True
         )
+        
+        # 💡 플러그인 속임수 추가 (봇 차단 회피)
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        """)
         
         page = context.new_page()
         page.route("**/*", lambda route: route.abort() 
@@ -288,7 +293,7 @@ def main():
                     break
                 else:
                     if step < len(query_list):
-                        time.sleep(0.5)
+                        time.sleep(random.uniform(1.5, 3.0)) # 💡 실패 시 인간다운 여유 대기
             
             if search_success and raw_text and map_url:
                 cleaned_text = clean_noise_text_with_anchors(raw_text)
@@ -308,11 +313,14 @@ def main():
                 execute_d1_query("UPDATE hospitals SET description='N/A', is_hanbang=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [fallback_type, h_id])
                 print(f"    ⚠️ [수집 실패] 'N/A' (기본구분: {fallback_type}) 처리 완료")
 
-            time.sleep(random.uniform(0.8, 1.5))
+            # 💡 다음 병원 검색 전 충분한 휴식 (IP 차단 완벽 회피)
+            sleep_time = random.uniform(2.5, 4.5)
+            print(f"    ⏳ (안티봇 휴식 {sleep_time:.1f}초)")
+            time.sleep(sleep_time)
             print("-" * 50)
 
         browser.close()
-    print("\n✨ 정밀 분류 및 수집이 초고속으로 완료되었습니다.")
+    print("\n✨ 정밀 분류 및 수집이 안정적으로 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
