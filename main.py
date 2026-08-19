@@ -31,11 +31,11 @@ def execute_d1_query(sql, params=[]):
             if data.get("success"):
                 return data["result"][0].get("results", [])
             else:
-                print(f"    ❌ D1 쿼리 실패: {data.get('errors')}")
+                print(f"      ❌ [D1 에러] 쿼리 실패: {data.get('errors')}")
         else:
-            print(f"    ❌ D1 HTTP 에러 [{res.status_code}]: {res.text}")
+            print(f"      ❌ [D1 에러] HTTP [{res.status_code}]: {res.text}")
     except Exception as e:
-        print(f"    ❌ D1 연결 예외 발생: {e}")
+        print(f"      ❌ [D1 예외] DB 통신 중 에러 발생: {e}")
     return None
 
 # ---------------------------------------------------------------------------
@@ -99,16 +99,15 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 6. Playwright 크롤링 (💡 안티봇 우회 및 안정화 적용)
+# 6. Playwright 크롤링 (💡 상세 로그 추가)
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
-    print(f"    📍 [검색] {query}")
+    print(f"    📍 [검색 시도] {query}")
     
     try:
-        # 💡 네이버 타임아웃 방어: 기존 10000ms -> 15000ms 여유 부여
         page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(800, 1500)) # 💡 인간다운 랜덤 대기 (봇 탐지 회피)
+        page.wait_for_timeout(random.randint(800, 1500))
         
         place_id = None
         html_content = page.content()
@@ -116,22 +115,29 @@ def crawl_naver_place_with_playwright(query, page):
         place_id_match = re.search(r'(?:hospital/|place/|data-id=")(\d{7,11})', html_content)
         if place_id_match:
             place_id = place_id_match.group(1)
+            print(f"      🔹 [ID 탐지] 네이버 고유 ID 확보 완료 ({place_id})")
+        else:
+            print("      🔸 [ID 누락] 검색 결과에서 병원 고유 ID를 찾지 못했습니다.")
 
         if place_id:
             navermap_url = f"https://m.place.naver.com/hospital/{place_id}/home"
             page.goto(navermap_url, timeout=15000, wait_until="domcontentloaded")
-            page.wait_for_timeout(random.randint(1200, 2000)) # 💡 상세페이지 렌더링을 확실하게 기다림
+            page.wait_for_timeout(random.randint(1200, 2000))
             
             try:
                 click_selectors = ["text=펼쳐보기", "text=영업시간", ".g2u4Z", ".group_fold", "[aria-expanded='false']"]
+                click_count = 0
                 for selector in click_selectors:
                     try:
                         elements = page.locator(selector)
                         for i in range(min(elements.count(), 2)):
                             elements.nth(i).click(timeout=1000)
-                            page.wait_for_timeout(random.randint(300, 700)) # 💡 클릭 후 자연스럽게 대기
+                            page.wait_for_timeout(random.randint(300, 700))
+                            click_count += 1
                     except:
                         pass
+                if click_count > 0:
+                    print(f"      🔹 [UI 조작] 숨김 정보 펼쳐보기 {click_count}회 클릭 완료")
             except Exception:
                 pass
                 
@@ -151,11 +157,13 @@ def crawl_naver_place_with_playwright(query, page):
             return None, html_content, search_url, False
             
     except Exception as e:
-        print(f"    ❌ 크롤링 에러: {e}")
+        # 💡 에러 메시지가 너무 길면 지저분하므로 핵심만 잘라서 출력
+        short_err = str(e).split('Call log:')[0].strip()
+        print(f"      ❌ [접속 에러] {short_err}")
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 7. 정밀 플래그 / 진료시간 / 소개글 파서 
+# 7. 정밀 플래그 / 진료시간 / 소개글 파서
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -254,7 +262,7 @@ def main():
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled", # 💡 webdriver 흔적 지우기
+                "--disable-blink-features=AutomationControlled",
                 "--disable-infobars"
             ]
         )
@@ -264,7 +272,6 @@ def main():
             java_script_enabled=True
         )
         
-        # 💡 플러그인 속임수 추가 (봇 차단 회피)
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
@@ -293,12 +300,18 @@ def main():
                     break
                 else:
                     if step < len(query_list):
-                        time.sleep(random.uniform(1.5, 3.0)) # 💡 실패 시 인간다운 여유 대기
+                        time.sleep(random.uniform(1.5, 3.0)) 
             
             if search_success and raw_text and map_url:
                 cleaned_text = clean_noise_text_with_anchors(raw_text)
                 flags = parse_flags(cleaned_text, raw_html, h_name)
                 
+                # 💡 데이터 퀄리티 로그 출력
+                desc_log = flags['description'][:25].replace('\n', ' ') + "..." if flags['description'] else "없음"
+                biz_log = "확보" if flags['business_hours'] else "없음"
+                lunch_log = flags['lunch_time'] if flags['lunch_time'] else "없음"
+                print(f"      🔹 [파싱 결과] 진료시간: {biz_log} | 점심: {lunch_log} | 소개: {desc_log}")
+
                 if flags['business_hours']:
                     sql = """UPDATE hospitals SET description=?, navermap_url=?, is_silbi=?, has_chuna=?, has_night=?, has_365=?, has_yakchim=?, is_cheopyak=?, has_parking=?, has_ward=?, is_traffic_acc=?, business_hours=?, lunch_time=?, is_hanbang=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"""
                     params = [flags['description'], map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'], flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'], flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'], flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id]
@@ -313,11 +326,9 @@ def main():
                 execute_d1_query("UPDATE hospitals SET description='N/A', is_hanbang=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [fallback_type, h_id])
                 print(f"    ⚠️ [수집 실패] 'N/A' (기본구분: {fallback_type}) 처리 완료")
 
-            # 💡 다음 병원 검색 전 충분한 휴식 (IP 차단 완벽 회피)
             sleep_time = random.uniform(2.5, 4.5)
-            print(f"    ⏳ (안티봇 휴식 {sleep_time:.1f}초)")
-            time.sleep(sleep_time)
-            print("-" * 50)
+            print(f"    ⏳ (안티봇 대기: {sleep_time:.1f}초)")
+            print("-" * 60)
 
         browser.close()
     print("\n✨ 정밀 분류 및 수집이 안정적으로 완료되었습니다.")
