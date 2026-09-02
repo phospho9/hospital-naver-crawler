@@ -32,15 +32,15 @@ def execute_d1_query(sql, params=[]):
             if data.get("success"):
                 return data["result"][0].get("results", [])
             else:
-                print(f"      ❌ [D1 에러] 쿼리 실패: {data.get('errors')}")
+                print(f"      ❌ [D1 에러] SQL 실패: {data.get('errors')}")
         else:
-            print(f"      ❌ [D1 에러] HTTP [{res.status_code}]: {res.text}")
+            print(f"      ❌ [D1 에러] HTTP 응답코드 [{res.status_code}]: {res.text[:200]}")
     except Exception as e:
-        print(f"      ❌ [D1 예외] DB 통신 중 에러 발생: {e}")
+        print(f"      ❌ [D1 예외] DB 통신 네트워크 에러: {e}")
     return None
 
 # ---------------------------------------------------------------------------
-# 3. 검색 쿼리 빌더 & 한/양방 구분
+# 3. 검색 쿼리 빌더 & 한/양방 판별
 # ---------------------------------------------------------------------------
 def build_search_queries(name, address):
     clean_name = re.sub(r'\(주\)|\(유\)|(의료|재단|사단)?법인|(?:[가-힣]+)?의료재단|(?:[가-힣]+)?재단', '', name).strip()
@@ -82,7 +82,7 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 구조화 JSON (__APOLLO_STATE__) 정밀 파서
+# 4. 네이버 구조화 JSON (__APOLLO_STATE__) 1순위 파서
 # ---------------------------------------------------------------------------
 def parse_from_apollo_state(raw_html, name):
     apollo_match = re.search(r'window\.__APOLLO_STATE__\s*=\s*(\{.*?\});<\/script>', raw_html, re.DOTALL)
@@ -118,7 +118,7 @@ def parse_from_apollo_state(raw_html, name):
         'conveniences': []
     }
 
-    # 1. 소개글 정밀 추출 (병원 공식 작성글 우선)
+    # 1. 소개글 정밀 추출
     desc = target_place.get("description") or target_place.get("microReview") or target_place.get("introduction")
     if desc:
         desc = re.sub(r'<[^>]+>', ' ', str(desc))
@@ -126,16 +126,15 @@ def parse_from_apollo_state(raw_html, name):
         if len(desc) > 5:
             flags['description'] = desc
 
-    # 2. 편의시설(주차 등) 정밀 추출
+    # 2. 편의시설 리스트
     conveniences = target_place.get("conveniences") or target_place.get("facilityInfo") or []
     if isinstance(conveniences, list):
         flags['conveniences'] = [str(c) for c in conveniences]
 
-    # 3. 진료시간 및 휴게(점심)시간 구조화 파싱
+    # 3. 요일별 진료시간 & 휴게시간(점심시간)
     weekdays_order = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일', '공휴일']
     parsed_hours = {}
     
-    # Apollo 스토어 내부의 BusinessHour 검색
     for k, v in data.items():
         if isinstance(v, dict) and ("BusinessHour" in k or ("day" in v and "businessHours" in v)):
             day = v.get("day")
@@ -155,7 +154,6 @@ def parse_from_apollo_state(raw_html, name):
                 elif desc_time:
                     parsed_hours[day_kor] = desc_time
 
-            # 점심시간 / 브레이크타임
             break_time = v.get("breakTime") or v.get("breakStartTime")
             if break_time and not flags['lunch_time']:
                 if isinstance(break_time, str):
@@ -187,7 +185,6 @@ def parse_from_text_fallback(text, raw_html, name=""):
     if not text:
         return flags
 
-    # 소개글 추출: '소개' 또는 '찾아가는길' 블록만 한정 발췌
     intro_match = re.search(r'(?:병원소개|소개|찾아가는길)\s*(.*?)(?:영업시간|진료시간|휴무일|편의|전화번호|홈\s*리뷰|블로그|제보)', text, re.DOTALL)
     if intro_match:
         clean_desc = intro_match.group(1).strip()
@@ -195,7 +192,6 @@ def parse_from_text_fallback(text, raw_html, name=""):
         if len(clean_desc) > 3:
             flags['description'] = clean_desc
 
-    # 요일별 진료시간 파싱
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     schedule = {}
     time_pattern = re.compile(
@@ -212,7 +208,6 @@ def parse_from_text_fallback(text, raw_html, name=""):
     if formatted:
         flags['business_hours'] = "\n".join(formatted)
 
-    # 점심시간 (11시~14시 시작하는 휴게시간만 인정)
     lunch_match = re.search(r'(?:휴게시간|점심시간|휴게|브레이크\s*타임)\s*[:]?\s*(\d{1,2}:\d{2})\s*[~–\-]\s*(\d{1,2}:\d{2})', text)
     if lunch_match:
         sh, eh = lunch_match.group(1), lunch_match.group(2)
@@ -225,7 +220,7 @@ def parse_from_text_fallback(text, raw_html, name=""):
     return flags
 
 # ---------------------------------------------------------------------------
-# 6. 종합 플래그 병합 파서
+# 6. 종합 플래그 병합 및 상세 진단 파서
 # ---------------------------------------------------------------------------
 def parse_flags(text, raw_html, name=""):
     flags = {
@@ -233,7 +228,8 @@ def parse_flags(text, raw_html, name=""):
         'has_yakchim': 0, 'is_cheopyak': 0, 'has_parking': 0, 
         'has_ward': 0, 'is_traffic_acc': 0, 'business_hours': None, 'lunch_time': None,
         'description': None,
-        'is_hanbang': '양방'
+        'is_hanbang': '양방',
+        '_parser_source': 'DOM Fallback'
     }
     if not text or not raw_html:
         return flags
@@ -244,25 +240,26 @@ def parse_flags(text, raw_html, name=""):
 
     flags['is_hanbang'] = determine_hanbang_type(name, combined_corpus)
 
-    # 1. 1차 시도: Apollo JSON 고도화 파싱
+    # 1. Apollo JSON 1차 파싱
     apollo_res = parse_from_apollo_state(raw_html, name)
     conveniences_str = ""
     if apollo_res:
+        flags['_parser_source'] = 'Apollo JSON'
         flags['description'] = apollo_res.get('description')
         flags['business_hours'] = apollo_res.get('business_hours')
         flags['lunch_time'] = apollo_res.get('lunch_time')
         conveniences_str = " ".join(apollo_res.get('conveniences', [])).lower()
 
-    # 2. 2차 시도: 누락된 데이터는 DOM 텍스트 파서로 보완
+    # 2. 미확보 필드 DOM 보완
     fallback_res = parse_from_text_fallback(text, raw_html, name)
-    if not flags['description']:
+    if not flags['description'] and fallback_res.get('description'):
         flags['description'] = fallback_res.get('description')
-    if not flags['business_hours']:
+    if not flags['business_hours'] and fallback_res.get('business_hours'):
         flags['business_hours'] = fallback_res.get('business_hours')
-    if not flags['lunch_time']:
+    if not flags['lunch_time'] and fallback_res.get('lunch_time'):
         flags['lunch_time'] = fallback_res.get('lunch_time')
 
-    # 3. 특화 진료 / 시설 배지 정밀 판별
+    # 3. 특화 진료 및 편의시설 배지 매핑
     all_context = combined_corpus + " " + conveniences_str
 
     flags['has_ward'] = 1 if ('병원' in n or '요양병원' in n) or re.search(r'(입원실|입원병동|병실)', all_context) else 0
@@ -282,7 +279,6 @@ def parse_flags(text, raw_html, name=""):
 # ---------------------------------------------------------------------------
 def crawl_naver_place_with_playwright(query, page):
     search_url = f"https://m.search.naver.com/search.naver?query={query}"
-    print(f"    📍 [검색 시도] {query}")
     
     try:
         page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
@@ -294,9 +290,9 @@ def crawl_naver_place_with_playwright(query, page):
         place_id_match = re.search(r'(?:hospital/|place/|data-id=")(\d{7,11})', html_content)
         if place_id_match:
             place_id = place_id_match.group(1)
-            print(f"      🔹 [ID 탐지] 네이버 고유 ID 확보 ({place_id})")
+            print(f"      🔹 [ID 탐지 성공] Place ID: {place_id}")
         else:
-            print("      🔸 [ID 누락] 검색 결과에서 고유 ID 미확인")
+            print(f"      🔸 [ID 미탐지] 검색 결과 내 고유 ID 없음")
 
         if place_id:
             navermap_url = f"https://m.place.naver.com/hospital/{place_id}/home"
@@ -304,6 +300,7 @@ def crawl_naver_place_with_playwright(query, page):
             page.wait_for_timeout(random.randint(1200, 1800))
             
             # 정보 펼쳐보기 탭 자동 확장
+            click_count = 0
             try:
                 click_selectors = ["text=펼쳐보기", "text=영업시간", ".g2u4Z", ".group_fold", "[aria-expanded='false']"]
                 for selector in click_selectors:
@@ -312,15 +309,18 @@ def crawl_naver_place_with_playwright(query, page):
                         for i in range(min(elements.count(), 2)):
                             elements.nth(i).click(timeout=800)
                             page.wait_for_timeout(300)
+                            click_count += 1
                     except Exception:
                         pass
+                if click_count > 0:
+                    print(f"      🔹 [UI 인터랙션] 상세정보 펼쳐보기 {click_count}회 클릭")
             except Exception:
                 pass
                 
             home_text = page.inner_text("body")
             home_html = page.content()
             
-            # 상세 정보 탭 탐색 (정보 탭)
+            # 상세 정보 탭 탐색
             info_text = ""
             try:
                 page.goto(f"https://m.place.naver.com/hospital/{place_id}/information", timeout=12000, wait_until="domcontentloaded")
@@ -336,15 +336,17 @@ def crawl_naver_place_with_playwright(query, page):
             
     except Exception as e:
         short_err = str(e).split('Call log:')[0].strip()
-        print(f"      ❌ [접속 에러] {short_err}")
+        print(f"      ❌ [접속 오류] {short_err}")
         return None, None, None, False
 
 # ---------------------------------------------------------------------------
-# 8. 메인 파이프라인 실행 루프
+# 8. 메인 파이프라인 실행 루프 (상세 관제 로그 적용)
 # ---------------------------------------------------------------------------
 def main():
     LIMIT = 50
-    print(f"\n🔍 [DB 연결] 클라우드플레어 D1에서 타겟 병의원 {LIMIT}개 조회 중...")
+    print(f"\n" + "=" * 70)
+    print(f"🏥 [병원 크롤러 가동] Cloudflare D1 대상 타겟 병원 {LIMIT}개 조회 중...")
+    print(f"=" * 70)
     
     sql_select = f"""
         SELECT id, name, address 
@@ -355,10 +357,10 @@ def main():
     hospitals = execute_d1_query(sql_select)
     
     if not hospitals:
-        print("🎉 모든 병원 정보가 최신 상태이거나 DB 통신 대상이 없습니다.")
+        print("🎉 모든 병원 데이터가 최신 상태이거나 대상 레코드가 없습니다.")
         return
 
-    print(f"🚀 총 {len(hospitals)}개 타겟 병원 정밀 크롤링을 시작합니다!\n")
+    print(f"🚀 총 {len(hospitals)}개 타겟 병원 목록을 확보했습니다. 정밀 수집을 시작합니다.\n")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -389,30 +391,51 @@ def main():
             h_name = h["name"]
             h_addr = h.get("address", "")
             
-            print(f"[{idx}/{len(hospitals)}] 🏥 병원명: {h_name} (ID: {h_id[:8]}...)")
+            print(f"\n[{idx:02d}/{len(hospitals):02d}] 🏥 병원: {h_name} | ID: {h_id[:10]}...")
+            print(f"    📍 등록 주소: {h_addr if h_addr else '주소 정보 없음'}")
             
             query_list = build_search_queries(h_name, h_addr)
             raw_text, raw_html, map_url, search_success = None, None, None, False
             
             for step, query in enumerate(query_list, 1):
+                print(f"    🔍 [시도 {step}/{len(query_list)}] '{query}' 검색 중...")
                 rt, html, url, is_success = crawl_naver_place_with_playwright(query, page)
                 if is_success:
                     raw_text, raw_html, map_url = rt, html, url
                     search_success = True
+                    print(f"    🎯 매칭 완료 (URL: {map_url})")
                     break
                 else:
                     if step < len(query_list):
-                        time.sleep(random.uniform(1.2, 2.2))
+                        time.sleep(random.uniform(1.2, 2.0))
             
             if search_success and raw_text and map_url:
                 flags = parse_flags(raw_text, raw_html, h_name)
                 
-                desc_log = flags['description'][:25].replace('\n', ' ') + "..." if flags['description'] else "없음"
-                biz_log = "확보 (개행 포함)" if flags['business_hours'] else "없음"
-                lunch_log = flags['lunch_time'] if flags['lunch_time'] else "없음"
-                parking_log = "가능" if flags['has_parking'] else "없음"
-                print(f"      🔹 [정밀 파싱] 진료시간: {biz_log} | 점심: {lunch_log} | 주차: {parking_log} | 소개: {desc_log}")
+                # --- 상세 데이터 추출 결과 브리핑 ---
+                active_badges = []
+                badge_map = {
+                    'has_parking': '주차', 'has_night': '야간진료', 'has_365': '365일',
+                    'has_chuna': '추나', 'has_yakchim': '약침', 'is_cheopyak': '첩약',
+                    'has_ward': '입원실', 'is_traffic_acc': '교통사고', 'is_silbi': '실비/도수'
+                }
+                for k, label in badge_map.items():
+                    if flags.get(k) == 1:
+                        active_badges.append(label)
 
+                desc_preview = flags['description'][:35].replace('\n', ' ') + "..." if flags['description'] else "미등록"
+                biz_lines = flags['business_hours'].split('\n') if flags['business_hours'] else []
+                biz_summary = f"{biz_lines[0]} 외 {len(biz_lines)-1}개 요일" if len(biz_lines) > 1 else (biz_lines[0] if biz_lines else "미등록")
+
+                print(f"    📊 [추출 분석 리포트]")
+                print(f"      ├─ 엔진 구분  : {flags['_parser_source']}")
+                print(f"      ├─ 종별 분류  : {flags['is_hanbang']}")
+                print(f"      ├─ 진료시간   : {biz_summary}")
+                print(f"      ├─ 점심시간   : {flags['lunch_time'] if flags['lunch_time'] else '미등록'}")
+                print(f"      ├─ 위치소개   : {desc_preview} ({len(flags['description']) if flags['description'] else 0}자)")
+                print(f"      └─ 활성 태그  : {', '.join(active_badges) if active_badges else '없음'}")
+
+                # D1 DB 반영
                 if flags['business_hours']:
                     sql = """UPDATE hospitals SET description=?, navermap_url=?, is_silbi=?, has_chuna=?, has_night=?, has_365=?, has_yakchim=?, is_cheopyak=?, has_parking=?, has_ward=?, is_traffic_acc=?, business_hours=?, lunch_time=?, is_hanbang=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"""
                     params = [flags['description'], map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'], flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'], flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'], flags['business_hours'], flags['lunch_time'], flags['is_hanbang'], h_id]
@@ -421,18 +444,21 @@ def main():
                     params = [flags['description'], map_url, flags['is_silbi'], flags['has_chuna'], flags['has_night'], flags['has_365'], flags['has_yakchim'], flags['is_cheopyak'], flags['has_parking'], flags['has_ward'], flags['is_traffic_acc'], flags['lunch_time'], flags['is_hanbang'], h_id]
                     
                 execute_d1_query(sql, params)
-                print(f"    ✅ [저장 완료] 구분: [{flags['is_hanbang']}] / URL 확보")
+                print(f"    💾 [D1 저장 완료] 병원 정보 갱신 성공")
             else:
                 fallback_type = "한방" if ("한의원" in h_name or "한방병원" in h_name) else "양방"
                 execute_d1_query("UPDATE hospitals SET description='N/A', is_hanbang=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [fallback_type, h_id])
-                print(f"    ⚠️ [수집 실패] 'N/A' (기본구분: {fallback_type}) 기록 완료")
+                print(f"    ⚠️ [수집 제외] 검색 결과 부재 -> 'N/A' (구분: {fallback_type}) 처리")
 
-            sleep_time = random.uniform(2.5, 4.0)
-            print(f"    ⏳ (안티봇 대기: {sleep_time:.1f}초)")
-            print("-" * 60)
+            sleep_sec = random.uniform(2.5, 4.0)
+            print(f"    ⏳ (안티봇 대기 {sleep_sec:.1f}초)")
+            print("-" * 70)
 
         browser.close()
-    print("\n✨ 고도화 정밀 수집이 완료되었습니다.")
+        
+    print(f"\n" + "=" * 70)
+    print("✨ [크롤러 완료] 50개 병원의 정밀 데이터 갱신 및 DB 저장이 정상 종료되었습니다.")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
