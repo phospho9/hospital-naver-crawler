@@ -3,7 +3,7 @@ name: Daily Naver Place Crawler
 on:
   schedule:
     # 💡 4시간마다 1회 실행 (0시, 4시, 8시, 12시, 16시, 20시 UTC 기준 / 한국시간 9시, 13시, 17시, 21시, 01시, 05시)
-    - cron: '15 */4 * * *'
+    - cron: '15 */2 * * *'
   workflow_dispatch:
 
 concurrency:
