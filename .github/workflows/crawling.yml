@@ -2,7 +2,7 @@ name: Daily Naver Place Crawler
 
 on:
   schedule:
-    # 💡 4시간마다 1회 실행 (0시, 4시, 8시, 12시, 16시, 20시 UTC 기준 / 한국시간 9시, 13시, 17시, 21시, 01시, 05시)
+    # 💡 2시간마다 15분에 실행
     - cron: '15 */2 * * *'
   workflow_dispatch:
 
@@ -31,19 +31,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 🔍 실제 설치된 Playwright 정확한 버전 추출
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(pip show playwright | grep Version | cut -d ' ' -f 2)" >> $GITHUB_OUTPUT
+
+      # 📦 정확한 버전 기반 캐싱
       - name: Cache Playwright Browsers
         id: playwright-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
 
-      - name: Install Playwright Browsers
+      # 🌐 캐시 미스 시 브라우저 및 시스템 의존성 설치
+      - name: Install Playwright Browsers & Deps
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install chromium
-
-      - name: Install Playwright System Dependencies
-        run: playwright install-deps chromium
+        run: playwright install --with-deps chromium
 
       - name: Run Crawler
         env:
