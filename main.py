@@ -82,14 +82,44 @@ def determine_hanbang_type(name, raw_text):
     return "양방"
 
 # ---------------------------------------------------------------------------
-# 4. 네이버 구조화 JSON (__APOLLO_STATE__) 정밀 파서 (정규식 완화)
+# ★ 신규 추가: 네이버 UI 찌꺼기 텍스트 정밀 제거기
+# ---------------------------------------------------------------------------
+def clean_naver_ui_text(text):
+    if not text:
+        return None
+        
+    # 1. HTML 태그 기본 제거
+    text = re.sub(r'<[^>]+>', ' ', str(text))
+    
+    # 2. 네이버 플레이스 고유 UI 버튼, 탭, 안내 문구 정규식으로 박멸
+    garbage_patterns = [
+        r'정보\s*수정\s*제안하기',
+        r'알고\s*계신\s*정보가\s*다르다면.*',
+        r'홈\s*리뷰\s*사진\s*지도\s*주변\s*정보',  # 상단 네비게이션 탭 뭉치
+        r'방문자\s*리뷰\s*\d*[건여]*',
+        r'블로그\s*리뷰\s*\d*[건여]*',
+        r'리뷰\s*\d*[건여]*',
+        r'사진\s*\d*[건여]*',
+        r'거리뷰', r'내비게이션', r'길찾기', r'주변\s*정보',
+        r'공유', r'저장', r'전화', r'톡톡', 
+        r'내용\s*더보기', r'접기', r'상세보기', r'제보'
+    ]
+    
+    for pattern in garbage_patterns:
+        text = re.sub(pattern, ' ', text)
+        
+    # 3. 연속된 공백 및 줄바꿈 정리
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text if len(text) > 5 else None
+
+# ---------------------------------------------------------------------------
+# 4. 네이버 구조화 JSON (__APOLLO_STATE__) 정밀 파서
 # ---------------------------------------------------------------------------
 def parse_from_apollo_state(raw_html):
-    # 다양한 script 패턴 대응
     pattern = r'__APOLLO_STATE__\s*=\s*(\{.+?\});\s*(?:window\.|<\/script>)'
     match = re.search(pattern, raw_html, re.DOTALL)
     if not match:
-        # 끝 세미콜론이 없거나 script 종료 직전 패턴
         pattern2 = r'__APOLLO_STATE__\s*=\s*(\{.+?\})<\/script>'
         match = re.search(pattern2, raw_html, re.DOTALL)
     
@@ -125,12 +155,9 @@ def parse_from_apollo_state(raw_html):
         'conveniences': []
     }
 
+    # ★ 정제기 적용
     desc = target_place.get("description") or target_place.get("microReview") or target_place.get("introduction")
-    if desc:
-        desc = re.sub(r'<[^>]+>', ' ', str(desc))
-        desc = re.sub(r'\s+', ' ', desc).strip()
-        if len(desc) > 5:
-            flags['description'] = desc
+    flags['description'] = clean_naver_ui_text(desc)
 
     conveniences = target_place.get("conveniences") or target_place.get("facilityInfo") or []
     if isinstance(conveniences, list):
@@ -188,14 +215,12 @@ def parse_from_text_fallback(text):
     if not text:
         return flags
 
-    # 소개글 추출 및 불필요한 태그 정밀 제거
-    intro_match = re.search(r'(?:병원소개|소개|찾아가는길)\s*(.*?)(?:영업시간|진료시간|휴무일|편의|전화번호|홈\s*리뷰|블로그|제보)', text, re.DOTALL)
+    # 추출 기준을 명확히 하고, 이후 UI 버튼 텍스트를 제거하도록 변경
+    intro_match = re.search(r'(?:병원소개|소개|찾아가는길)\s*(.*?)(?:영업시간|진료시간|휴무일|편의|전화번호|홈\s*리뷰|블로그|제보|정보\s*수정)', text, re.DOTALL)
     if intro_match:
         clean_desc = intro_match.group(1).strip()
-        clean_desc = re.sub(r'(내용\s*더보기|접수마감|거리뷰|지도|내비게이션|홈|리뷰|사진|주변\s*정보|전화|공유|길찾기|고유가|알고\s*계신\s*정보).*', '', clean_desc).strip()
-        clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
-        if len(clean_desc) > 3:
-            flags['description'] = clean_desc
+        # ★ 정제기 적용
+        flags['description'] = clean_naver_ui_text(clean_desc)
 
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     schedule = {}
@@ -266,7 +291,6 @@ def parse_flags(text, raw_html, name=""):
     # 3. [오탐 원천 차단] 실제 진료시간 데이터 기반 계산 로직
     biz_hours_str = flags['business_hours'] or ""
     
-    # 야간진료: 실제 운영시간 중 20:00 이후 종료가 있는지 판별
     night_found = False
     for end_time in re.findall(r'~\s*(\d{1,2}):(\d{2})', biz_hours_str):
         hour = int(end_time[0])
@@ -275,18 +299,13 @@ def parse_flags(text, raw_html, name=""):
             break
     flags['has_night'] = 1 if (night_found or "야간진료" in n) else 0
 
-    # 365일 진료: 토요일/일요일 모두 영업하는지 확인 (정기휴무 제외)
     has_sat = "토요일:" in biz_hours_str and "휴무" not in biz_hours_str.split("토요일:")[1].split("\n")[0]
     has_sun = "일요일:" in biz_hours_str and "휴무" not in biz_hours_str.split("일요일:")[1].split("\n")[0]
     flags['has_365'] = 1 if (has_sat and has_sun) or "365" in n else 0
 
-    # 주차: 편의시설 태그 우선, 텍스트 확인
     flags['has_parking'] = 1 if ('주차' in conveniences_str or '주차' in (flags['description'] or "")) else 0
-
-    # 입원실: '병원' 급 이상이거나 설명에 병실/입원실 언급 시
     flags['has_ward'] = 1 if ('병원' in n and '의원' not in n) or ('입원실' in (flags['description'] or "")) else 0
 
-    # 치료별 특화 (병원명 또는 상세 소개글에 직접 명시된 경우만 인정)
     desc_and_name = n + " " + (flags['description'] or "").lower()
     flags['has_chuna'] = 1 if re.search(r'(추나|척추교정)', desc_and_name) else 0
     flags['has_yakchim'] = 1 if re.search(r'(약침|봉침|봉약침)', desc_and_name) else 0
